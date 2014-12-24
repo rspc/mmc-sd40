@@ -85,6 +85,11 @@ static void ms_print_debug_regs(struct realtek_pci_ms *host)
 
 #endif
 
+static inline int ms_get_cd_int(struct realtek_pci_ms *host)
+{
+	return rtsx_pci_readl(host->pcr, RTSX_BIPR) & MS_EXIST;
+}
+
 static int ms_power_on(struct realtek_pci_ms *host)
 {
 	struct rtsx_pcr *pcr = host->pcr;
@@ -409,6 +414,9 @@ static void rtsx_pci_ms_handle_req(struct work_struct *work)
 	struct memstick_host *msh = host->msh;
 	int rc;
 
+	if (host->req)
+		return;
+
 	mutex_lock(&pcr->pcr_mutex);
 
 	rtsx_pci_start_run(pcr);
@@ -419,15 +427,16 @@ static void rtsx_pci_ms_handle_req(struct work_struct *work)
 	rtsx_pci_write_register(pcr, CARD_SHARE_MODE,
 			CARD_SHARE_MASK, CARD_SHARE_48_MS);
 
-	if (!host->req) {
-		do {
-			rc = memstick_next_req(msh, &host->req);
-			dev_dbg(ms_dev(host), "next req %d\n", rc);
-
-			if (!rc)
-				host->req->error = rtsx_pci_ms_issue_cmd(host);
-		} while (!rc);
-	}
+	while (true) {
+		rc = memstick_next_req(msh, &host->req);
+		dev_dbg(ms_dev(host), "next req %d\n", rc);
+		if (rc)
+			break;
+		if (!ms_get_cd_int(host))
+			host->req->error = -ENOMEDIUM;
+		else
+			host->req->error = rtsx_pci_ms_issue_cmd(host);
+	};
 
 	mutex_unlock(&pcr->pcr_mutex);
 }
