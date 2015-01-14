@@ -22,6 +22,7 @@
 #include <linux/module.h>
 #include <linux/highmem.h>
 #include <linux/delay.h>
+#include <linux/pm.h>
 #include <linux/platform_device.h>
 #include <linux/memstick.h>
 #include <linux/mfd/rtsx_pci.h>
@@ -514,11 +515,11 @@ static int rtsx_pci_ms_set_param(struct memstick_host *msh,
 	return 0;
 }
 
-#ifdef CONFIG_PM
+#ifdef CONFIG_PM_SLEEP
 
-static int rtsx_pci_ms_suspend(struct platform_device *pdev, pm_message_t state)
+static int rtsx_pci_ms_suspend(struct device *dev)
 {
-	struct realtek_pci_ms *host = platform_get_drvdata(pdev);
+	struct realtek_pci_ms *host = dev_get_drvdata(dev);
 	struct memstick_host *msh = host->msh;
 
 	dev_dbg(ms_dev(host), "--> %s\n", __func__);
@@ -527,9 +528,9 @@ static int rtsx_pci_ms_suspend(struct platform_device *pdev, pm_message_t state)
 	return 0;
 }
 
-static int rtsx_pci_ms_resume(struct platform_device *pdev)
+static int rtsx_pci_ms_resume(struct device *dev)
 {
-	struct realtek_pci_ms *host = platform_get_drvdata(pdev);
+	struct realtek_pci_ms *host = dev_get_drvdata(dev);
 	struct memstick_host *msh = host->msh;
 
 	dev_dbg(ms_dev(host), "--> %s\n", __func__);
@@ -537,13 +538,7 @@ static int rtsx_pci_ms_resume(struct platform_device *pdev)
 	memstick_resume_host(msh);
 	return 0;
 }
-
-#else /* CONFIG_PM */
-
-#define rtsx_pci_ms_suspend NULL
-#define rtsx_pci_ms_resume NULL
-
-#endif /* CONFIG_PM */
+#endif /* CONFIG_PM_SLEEP */
 
 static void rtsx_pci_ms_card_event(struct platform_device *pdev)
 {
@@ -641,6 +636,9 @@ static int rtsx_pci_ms_drv_remove(struct platform_device *pdev)
 	return 0;
 }
 
+static SIMPLE_DEV_PM_OPS(rtsx_pci_ms_pm_ops,
+	rtsx_pci_ms_suspend, rtsx_pci_ms_resume);
+
 static struct platform_device_id rtsx_pci_ms_ids[] = {
 	{
 		.name = DRV_NAME_RTSX_PCI_MS,
@@ -654,10 +652,9 @@ static struct platform_driver rtsx_pci_ms_driver = {
 	.probe		= rtsx_pci_ms_drv_probe,
 	.remove		= rtsx_pci_ms_drv_remove,
 	.id_table       = rtsx_pci_ms_ids,
-	.suspend	= rtsx_pci_ms_suspend,
-	.resume		= rtsx_pci_ms_resume,
 	.driver		= {
 		.name	= DRV_NAME_RTSX_PCI_MS,
+		.pm	= &rtsx_pci_ms_pm_ops,
 	},
 };
 module_platform_driver(rtsx_pci_ms_driver);
