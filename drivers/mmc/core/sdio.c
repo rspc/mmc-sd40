@@ -575,18 +575,17 @@ out:
 
 /*
  * Handle the detection and initialisation of a card.
- *
- * In the case of a resume, "oldcard" will contain the card
- * we're trying to reinitialise.
  */
-static int mmc_sdio_init_card(struct mmc_host *host, u32 ocr,
-			      struct mmc_card *oldcard, int powered_resume)
+static int mmc_sdio_do_init_card(struct mmc_host *host, u32 ocr,
+		struct mmc_card *card, int powered_resume, bool reinit)
 {
-	struct mmc_card *card;
 	int err;
+	unsigned short old_vendor = 0;
+	unsigned short old_device = 0;
 	int retries = 10;
 	u32 rocr = 0;
 	u32 ocr_card = ocr;
+	u32 raw_cid[4];
 
 	BUG_ON(!host);
 	WARN_ON(!host->claimed);
@@ -619,31 +618,20 @@ try_again:
 			goto err;
 	}
 
-	/*
-	 * Allocate card structure.
-	 */
-	card = mmc_alloc_card(host, NULL);
-	if (IS_ERR(card)) {
-		err = PTR_ERR(card);
-		goto err;
-	}
-
 	if ((rocr & R4_MEMORY_PRESENT) &&
-	    mmc_sd_get_cid(host, ocr & rocr, card->raw_cid, NULL) == 0) {
+		mmc_sd_get_cid(host, ocr & rocr, raw_cid, NULL) == 0) {
 		card->type = MMC_TYPE_SD_COMBO;
-
-		if (oldcard && (oldcard->type != MMC_TYPE_SD_COMBO ||
-		    memcmp(card->raw_cid, oldcard->raw_cid, sizeof(card->raw_cid)) != 0)) {
-			mmc_remove_card(card);
-			return -ENOENT;
+		if (reinit) {
+			int cmp_cid = memcmp(raw_cid, card->raw_cid,
+					sizeof(raw_cid));
+			if (cmp_cid != 0 || card->type != MMC_TYPE_SD_COMBO)
+				return -ENOENT;
 		}
 	} else {
-		card->type = MMC_TYPE_SDIO;
-
-		if (oldcard && oldcard->type != MMC_TYPE_SDIO) {
-			mmc_remove_card(card);
+		if (reinit && card->type != MMC_TYPE_SDIO)
 			return -ENOENT;
-		}
+
+		card->type = MMC_TYPE_SDIO;
 	}
 
 	/*
@@ -666,7 +654,6 @@ try_again:
 			sdio_reset(host);
 			mmc_go_idle(host);
 			mmc_send_if_cond(host, host->ocr_avail);
-			mmc_remove_card(card);
 			retries--;
 			goto try_again;
 		} else if (err) {
@@ -684,20 +671,12 @@ try_again:
 		err = mmc_send_relative_addr(host, &card->rca);
 		if (err)
 			goto remove;
-
-		/*
-		 * Update oldcard with the new RCA received from the SDIO
-		 * device -- we're doing this so that it's updated in the
-		 * "card" struct when oldcard overwrites that later.
-		 */
-		if (oldcard)
-			oldcard->rca = card->rca;
 	}
 
 	/*
 	 * Read CSD, before selecting the card
 	 */
-	if (!oldcard && card->type == MMC_TYPE_SD_COMBO) {
+	if (!reinit && card->type == MMC_TYPE_SD_COMBO) {
 		err = mmc_sd_get_csd(host, card);
 		if (err)
 			return err;
@@ -737,6 +716,11 @@ try_again:
 	if (err)
 		goto remove;
 
+	if (reinit) {
+		old_vendor = card->cis.vendor;
+		old_device = card->cis.device;
+	}
+
 	/*
 	 * Read the common CIS tuples.
 	 */
@@ -744,20 +728,17 @@ try_again:
 	if (err)
 		goto remove;
 
-	if (oldcard) {
-		int same = (card->cis.vendor == oldcard->cis.vendor &&
-			    card->cis.device == oldcard->cis.device);
-		mmc_remove_card(card);
+	if (reinit) {
+		int same = (card->cis.vendor == old_vendor &&
+			    card->cis.device == old_device);
 		if (!same)
 			return -ENOENT;
-
-		card = oldcard;
 	}
 	card->ocr = ocr_card;
 	mmc_fixup_device(card, NULL);
 
 	if (card->type == MMC_TYPE_SD_COMBO) {
-		err = mmc_sd_setup_card(host, card, oldcard != NULL);
+		err = mmc_sd_setup_card(host, card, reinit);
 		/* handle as SDIO-only card if memory init failed */
 		if (err) {
 			mmc_go_idle(host);
@@ -775,6 +756,9 @@ try_again:
 	err = sdio_disable_cd(card);
 	if (err)
 		goto remove;
+
+	if (mmc_card_uhsii(card))
+		return err;
 
 	/* Initialization sequence for UHS-I cards */
 	/* Only if card supports 1.8v and UHS signaling */
@@ -805,16 +789,21 @@ try_again:
 			goto remove;
 	}
 finish:
-	if (!oldcard)
-		host->card = card;
-	return 0;
-
 remove:
-	if (!oldcard)
-		mmc_remove_card(card);
-
 err:
 	return err;
+}
+
+static inline int mmc_sdio_reinit_card(struct mmc_host *host, u32 ocr,
+		struct mmc_card *card, int powered_resume)
+{
+	return mmc_sdio_do_init_card(host, ocr, card, powered_resume, true);
+}
+
+static inline int mmc_sdio_init_card(struct mmc_host *host, u32 ocr,
+		struct mmc_card *card, int powered_resume)
+{
+	return mmc_sdio_do_init_card(host, ocr, card, powered_resume, false);
 }
 
 /*
@@ -973,7 +962,7 @@ static int mmc_sdio_resume(struct mmc_host *host)
 		mmc_send_if_cond(host, host->card->ocr);
 		err = mmc_send_io_op_cond(host, 0, NULL);
 		if (!err)
-			err = mmc_sdio_init_card(host, host->card->ocr,
+			err = mmc_sdio_reinit_card(host, host->card->ocr,
 						 host->card,
 						 mmc_card_keep_power(host));
 	} else if (mmc_card_keep_power(host) && mmc_card_wake_sdio_irq(host)) {
@@ -1031,8 +1020,8 @@ static int mmc_sdio_power_restore(struct mmc_host *host)
 	if (ret)
 		goto out;
 
-	ret = mmc_sdio_init_card(host, host->card->ocr, host->card,
-				mmc_card_keep_power(host));
+	ret = mmc_sdio_reinit_card(host, host->card->ocr, host->card,
+			mmc_card_keep_power(host));
 	if (!ret && host->sdio_irqs)
 		mmc_signal_sdio_irq(host);
 
@@ -1078,8 +1067,10 @@ int mmc_attach_sdio(struct mmc_host *host)
 	u32 ocr, rocr;
 	struct mmc_card *card;
 
-	BUG_ON(!host);
+	BUG_ON(!host && !host->card);
 	WARN_ON(!host->claimed);
+
+	card = host->card;
 
 	err = mmc_send_io_op_cond(host, 0, &ocr);
 	if (err)
@@ -1103,7 +1094,7 @@ int mmc_attach_sdio(struct mmc_host *host)
 	/*
 	 * Detect and init the card.
 	 */
-	err = mmc_sdio_init_card(host, rocr, NULL, 0);
+	err = mmc_sdio_init_card(host, rocr, card, 0);
 	if (err)
 		goto err;
 
@@ -1137,7 +1128,7 @@ int mmc_attach_sdio(struct mmc_host *host)
 	 * Initialize (but don't add) all present functions.
 	 */
 	for (i = 0; i < funcs; i++, card->sdio_funcs++) {
-		err = sdio_init_func(host->card, i + 1);
+		err = sdio_init_func(card, i + 1);
 		if (err)
 			goto remove;
 
@@ -1152,7 +1143,7 @@ int mmc_attach_sdio(struct mmc_host *host)
 	 * First add the card to the driver model...
 	 */
 	mmc_release_host(host);
-	err = mmc_add_card(host->card);
+	err = mmc_add_card(card);
 	if (err)
 		goto remove_added;
 
@@ -1160,7 +1151,7 @@ int mmc_attach_sdio(struct mmc_host *host)
 	 * ...then the SDIO functions.
 	 */
 	for (i = 0;i < funcs;i++) {
-		err = sdio_add_func(host->card->sdio_func[i]);
+		err = sdio_add_func(card->sdio_func[i]);
 		if (err)
 			goto remove_added;
 	}
@@ -1187,4 +1178,3 @@ err:
 
 	return err;
 }
-

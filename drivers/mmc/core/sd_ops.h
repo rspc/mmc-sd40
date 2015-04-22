@@ -20,6 +20,13 @@ int mmc_app_send_scr(struct mmc_card *card, u32 *scr);
 int mmc_sd_switch(struct mmc_card *card, int mode, int group,
 	u8 value, u8 *resp);
 int mmc_app_sd_status(struct mmc_card *card, void *ssr);
+int mmc_sd_send_device_init_ccmd(struct mmc_card *card);
+int mmc_sd_send_enumerate_ccmd(struct mmc_card *card);
+int mmc_sd_send_go_dormant_state_ccmd(struct mmc_card *card, int hibernate);
+int mmc_sd_read_cfg_ccmd(struct mmc_card *card, u8 offset, u8 plen, u32 *buf);
+int mmc_sd_write_cfg_ccmd(struct mmc_card *card, u8 offset, u8 plen, u32 *buf);
+void mmc_sd_tran_pack_ccmd(struct mmc_card *card, struct mmc_command *cmd);
+void mmc_sd_tran_pack_dcmd(struct mmc_card *card, struct mmc_command *cmd);
 
 #endif
 

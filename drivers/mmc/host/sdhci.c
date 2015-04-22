@@ -143,6 +143,32 @@ static void sdhci_dumpregs(struct sdhci_host *host)
  *                                                                           *
 \*****************************************************************************/
 
+static int sdhci_checkw(struct sdhci_host *host, int reg,
+	u16 mask, u16 done, int msec)
+{
+	while (msec > 0) {
+		if ((sdhci_readw(host, reg) & mask) == done)
+			return 0;
+		mdelay(1);
+		msec--;
+	};
+	DBG("check %x(%x) %x failed\n", reg, mask, done);
+	return -ETIMEDOUT;
+}
+
+static int sdhci_checkl(struct sdhci_host *host, int reg,
+	u32 mask, u32 done, int msec)
+{
+	while (msec > 0) {
+		if ((sdhci_readl(host, reg) & mask) == done)
+			return 0;
+		mdelay(1);
+		msec--;
+	};
+	DBG("check %x(%x) %x failed\n", reg, mask, done);
+	return -ETIMEDOUT;
+}
+
 static void sdhci_set_card_detection(struct sdhci_host *host, bool enable)
 {
 	u32 present;
@@ -230,6 +256,9 @@ static void sdhci_set_ios(struct mmc_host *mmc, struct mmc_ios *ios);
 
 static void sdhci_init(struct sdhci_host *host, int soft)
 {
+	if ((host->flags & SDHCI_HOST_V4_ENABLED) && !soft)
+		sdhci_writew(host, SDHCI_UHSII_HOST_FULL_RESET,
+			SDHCI_UHSII_SOFT_RESET);
 	if (soft)
 		sdhci_do_reset(host, SDHCI_RESET_CMD|SDHCI_RESET_DATA);
 	else
@@ -243,6 +272,17 @@ static void sdhci_init(struct sdhci_host *host, int soft)
 
 	sdhci_writel(host, host->ier, SDHCI_INT_ENABLE);
 	sdhci_writel(host, host->ier, SDHCI_SIGNAL_ENABLE);
+
+	if (host->flags & SDHCI_HOST_V4_ENABLED) {
+		u32 ier = SDHCI_UHSII_INT_HEADER | SDHCI_UHSII_INT_RES |
+			SDHCI_UHSII_INT_EXPIRED | SDHCI_UHSII_INT_CRC |
+			SDHCI_UHSII_INT_FRAMING | SDHCI_UHSII_INT_TID |
+			SDHCI_UHSII_INT_UNRECOVERABLE | SDHCI_UHSII_INT_EBSY |
+			SDHCI_UHSII_INT_ADMA | SDHCI_UHSII_INT_TIMEOUT;
+
+		sdhci_writel(host, ier, SDHCI_UHSII_INT_ENABLE);
+		sdhci_writel(host, ier, SDHCI_UHSII_SIGNAL_ENABLE);
+	}
 
 	if (soft) {
 		/* force clock reconfiguration */
@@ -857,8 +897,14 @@ static void sdhci_prepare_data(struct sdhci_host *host, struct mmc_command *cmd)
 				host->flags &= ~SDHCI_REQ_USE_DMA;
 			} else {
 				WARN_ON(sg_cnt != 1);
-				sdhci_writel(host, sg_dma_address(data->sg),
-					SDHCI_DMA_ADDRESS);
+				if (host->uhsii_if_enabled)
+					sdhci_writel(host,
+						sg_dma_address(data->sg),
+						SDHCI_ADMA_ADDRESS);
+				else
+					sdhci_writel(host,
+						sg_dma_address(data->sg),
+						SDHCI_DMA_ADDRESS);
 			}
 		}
 	}
@@ -898,9 +944,15 @@ static void sdhci_prepare_data(struct sdhci_host *host, struct mmc_command *cmd)
 	sdhci_set_transfer_irqs(host);
 
 	/* Set the DMA boundary value and block size */
-	sdhci_writew(host, SDHCI_MAKE_BLKSZ(SDHCI_DEFAULT_BOUNDARY_ARG,
-		data->blksz), SDHCI_BLOCK_SIZE);
-	sdhci_writew(host, data->blocks, SDHCI_BLOCK_COUNT);
+	if (host->uhsii_if_enabled) {
+		sdhci_writew(host, SDHCI_MAKE_BLKSZ(SDHCI_DEFAULT_BOUNDARY_ARG,
+			data->blksz), SDHCI_UHSII_BLOCK_SIZE);
+		sdhci_writew(host, data->blocks, SDHCI_UHSII_BLOCK_COUNT);
+	} else {
+		sdhci_writew(host, SDHCI_MAKE_BLKSZ(SDHCI_DEFAULT_BOUNDARY_ARG,
+			data->blksz), SDHCI_BLOCK_SIZE);
+		sdhci_writew(host, data->blocks, SDHCI_BLOCK_COUNT);
+	}
 }
 
 static void sdhci_set_transfer_mode(struct sdhci_host *host,
@@ -950,6 +1002,32 @@ static void sdhci_set_transfer_mode(struct sdhci_host *host,
 	sdhci_writew(host, mode, SDHCI_TRANSFER_MODE);
 }
 
+static void sdhci_uhsii_set_transfer_mode(struct sdhci_host *host,
+	struct mmc_command *cmd)
+{
+	u16 mode = 0;
+	struct mmc_data *data = cmd->data;
+
+	if (UHSII_CHK_CCMD(cmd->tlp_send.header)) {
+		if (cmd->flags & MMC_RSP_BUSY)
+			mode |= SDHCI_UHSII_TRNS_WAIT_EBSY;
+	} else {
+		u8 tmode = (cmd->tlp_send.argument & UHSII_ARG_TMODE_MASK) >>
+			UHSII_ARG_TMODE_SHIFT;
+		if (tmode & UHSII_TMODE_DM_HD)
+			mode |= SDHCI_UHSII_TRANS_2LANE_HD;
+		mode |= SDHCI_UHSII_TRNS_BLK_CNT_EN;
+		mode |= SDHCI_UHSII_TRNS_WAIT_EBSY;
+
+		if (data->flags & MMC_DATA_WRITE)
+			mode |= SDHCI_UHSII_TRNS_WRITE;
+		if (host->flags & SDHCI_REQ_USE_DMA)
+			mode |= SDHCI_UHSII_TRNS_DMA;
+	}
+
+	sdhci_writew(host, mode, SDHCI_UHSII_TRANSFER_MODE);
+}
+
 static void sdhci_finish_data(struct sdhci_host *host)
 {
 	struct mmc_data *data;
@@ -988,7 +1066,7 @@ static void sdhci_finish_data(struct sdhci_host *host)
 	 * a) open-ended multiblock transfer (no CMD23)
 	 * b) error in multiblock transfer
 	 */
-	if (data->stop &&
+	if (!host->uhsii_if_enabled && data->stop &&
 	    (data->error ||
 	     !host->mrq->sbc)) {
 
@@ -1004,6 +1082,51 @@ static void sdhci_finish_data(struct sdhci_host *host)
 		sdhci_send_command(host, data->stop);
 	} else
 		tasklet_schedule(&host->finish_tasklet);
+}
+
+static void sdhci_send_native_tlp(struct sdhci_host *host, struct mmc_tlp *tlp)
+{
+	int i;
+	unsigned long timeout;
+	u16 cmdreg;
+	u8 plen, cmd_len = 4;
+
+	/* Wait max 10 ms */
+	timeout = 10;
+
+	if (sdhci_checkl(host, SDHCI_PRESENT_STATE, SDHCI_CMD_INHIBIT, 0, 10)) {
+		pr_err("%s: cmd busy...\n", mmc_hostname(host->mmc));
+		sdhci_dumpregs(host);
+		tlp->error = -EIO;
+		tasklet_schedule(&host->finish_tasklet);
+		return;
+	}
+
+	mod_timer(&host->timer, jiffies + 10 * HZ);
+
+	host->tlp = tlp;
+
+	plen = (u8)((tlp->tlp_send->argument & UHSII_ARG_PLEN_MASK) >>
+		UHSII_ARG_PLEN_SHIFT);
+
+	sdhci_writew(host, cpu_to_be16(tlp->tlp_send->header),
+			SDHCI_UHSII_CMD_HEADER);
+	sdhci_writew(host, cpu_to_be16(tlp->tlp_send->argument),
+			SDHCI_UHSII_CMD_ARGUMENT);
+	if (tlp->tlp_send->argument & UHSII_ARG_DIR_WRITE) {
+		for (i = 0; i < UHSII_PLEN_DWORDS(plen); i++)
+			sdhci_writel(host,
+				cpu_to_be32(tlp->tlp_send->payload[i]),
+				SDHCI_UHSII_CMD_PAYLOAD + 4 * i);
+
+		cmd_len = UHSII_PLEN_BYTES(plen) + 4;
+	}
+
+	cmdreg = (cmd_len & SDHCI_UHSII_COMMAND_LEN_MASK) <<
+		SDHCI_UHSII_COMMAND_LEN_SHIFT;
+	if (tlp->cmd_type == UHSII_COMMAND_GO_DORMANT)
+		cmdreg |= SDHCI_UHSII_GO_DORMANT;
+	sdhci_writew(host, cmdreg, SDHCI_UHSII_COMMAND);
 }
 
 void sdhci_send_command(struct sdhci_host *host, struct mmc_command *cmd)
@@ -1051,6 +1174,35 @@ void sdhci_send_command(struct sdhci_host *host, struct mmc_command *cmd)
 
 	sdhci_prepare_data(host, cmd);
 
+	if (cmd->use_tlp) {
+		int i;
+		u16 cmdreg;
+		u8 plen = 1, cmd_len = 8;
+
+		if (!UHSII_CHK_CCMD(cmd->tlp_send.header)) {
+			plen = 2;
+			cmd_len = 12;
+		}
+
+		sdhci_writew(host, cpu_to_be16(cmd->tlp_send.header),
+				SDHCI_UHSII_CMD_HEADER);
+		sdhci_writew(host, cpu_to_be16(cmd->tlp_send.argument),
+				SDHCI_UHSII_CMD_ARGUMENT);
+		for (i = 0; i < plen; i++)
+			sdhci_writel(host,
+				cpu_to_be32(cmd->tlp_send.payload[i]),
+				SDHCI_UHSII_CMD_PAYLOAD + (4 * i));
+
+		sdhci_uhsii_set_transfer_mode(host, cmd);
+
+		cmdreg = (cmd_len & SDHCI_UHSII_COMMAND_LEN_MASK) <<
+			SDHCI_UHSII_COMMAND_LEN_SHIFT;
+		if (cmd->data)
+			cmdreg |= SDHCI_UHSII_DATA_PRESENT;
+		sdhci_writew(host, cmdreg, SDHCI_UHSII_COMMAND);
+		return;
+	}
+
 	sdhci_writel(host, cmd->arg, SDHCI_ARGUMENT);
 
 	sdhci_set_transfer_mode(host, cmd);
@@ -1086,26 +1238,62 @@ void sdhci_send_command(struct sdhci_host *host, struct mmc_command *cmd)
 }
 EXPORT_SYMBOL_GPL(sdhci_send_command);
 
-static void sdhci_finish_command(struct sdhci_host *host)
+static void sdhci_read_rsp_136(struct sdhci_host *host)
 {
 	int i;
 
+	if (host->cmd->use_tlp) {
+		for (i = 0; i < 4; i++) {
+			u32 resp = sdhci_raw_readl(host,
+					SDHCI_UHSII_RESP_PAYLOAD + i * 4);
+			host->cmd->resp[i] = be32_to_cpu(resp);
+		}
+	} else {
+		/* CRC is stripped so we need to do some shifting. */
+		for (i = 0; i < 4; i++) {
+			host->cmd->resp[i] = sdhci_readl(host,
+				SDHCI_RESPONSE + (3 - i) * 4) << 8;
+			if (i != 3)
+				host->cmd->resp[i] |= sdhci_readb(host,
+					SDHCI_RESPONSE + (3 - i) * 4 - 1);
+		}
+	}
+
+}
+
+static void sdhci_read_rsp_48(struct sdhci_host *host)
+{
+	if (host->cmd->use_tlp)
+		host->cmd->resp[0] = be32_to_cpu(
+			sdhci_raw_readl(host, SDHCI_UHSII_RESP_PAYLOAD));
+	else
+		host->cmd->resp[0] = sdhci_readl(host, SDHCI_RESPONSE);
+}
+
+static void sdhci_finish_command(struct sdhci_host *host)
+{
 	BUG_ON(host->cmd == NULL);
 
-	if (host->cmd->flags & MMC_RSP_PRESENT) {
-		if (host->cmd->flags & MMC_RSP_136) {
-			/* CRC is stripped so we need to do some shifting. */
-			for (i = 0;i < 4;i++) {
-				host->cmd->resp[i] = sdhci_readl(host,
-					SDHCI_RESPONSE + (3-i)*4) << 8;
-				if (i != 3)
-					host->cmd->resp[i] |=
-						sdhci_readb(host,
-						SDHCI_RESPONSE + (3-i)*4-1);
-			}
-		} else {
-			host->cmd->resp[0] = sdhci_readl(host, SDHCI_RESPONSE);
+	if (host->cmd->use_tlp) {
+		u16 arg = sdhci_readw(host, SDHCI_UHSII_RESP_ARGUMENT);
+
+		arg = be16_to_cpu(arg);
+		if (arg & UHSII_ARG_RES_NACK) {
+			host->cmd->error = -EIO;
+			DBG("Response NACK!");
+
+			tasklet_schedule(&host->finish_tasklet);
+			host->cmd = NULL;
+
+			return;
 		}
+	}
+
+	if (host->cmd->flags & MMC_RSP_PRESENT) {
+		if (host->cmd->flags & MMC_RSP_136)
+			sdhci_read_rsp_136(host);
+		else
+			sdhci_read_rsp_48(host);
 	}
 
 	host->cmd->error = 0;
@@ -1125,6 +1313,21 @@ static void sdhci_finish_command(struct sdhci_host *host)
 
 		host->cmd = NULL;
 	}
+}
+
+static void sdhci_finish_native_tlp(struct sdhci_host *host)
+{
+	int i;
+
+	host->tlp->tlp_back->header = be16_to_cpu(
+		sdhci_readw(host, SDHCI_UHSII_RESP_HEADER));
+	host->tlp->tlp_back->argument = be16_to_cpu(
+		sdhci_readw(host, SDHCI_UHSII_RESP_ARGUMENT));
+	for (i = 0; i < 4; i++)
+		host->tlp->tlp_back->payload[i] = be32_to_cpu(
+			sdhci_readl(host, SDHCI_UHSII_RESP_PAYLOAD + 4 * i));
+
+	tasklet_schedule(&host->finish_tasklet);
 }
 
 static u16 sdhci_get_preset_value(struct sdhci_host *host)
@@ -1169,7 +1372,8 @@ void sdhci_set_clock(struct sdhci_host *host, unsigned int clock)
 
 	host->mmc->actual_clock = 0;
 
-	sdhci_writew(host, 0, SDHCI_CLOCK_CONTROL);
+	if (!host->uhsii_if_enabled)
+		sdhci_writew(host, 0, SDHCI_CLOCK_CONTROL);
 
 	if (clock == 0)
 		return;
@@ -1384,7 +1588,7 @@ static void sdhci_request(struct mmc_host *mmc, struct mmc_request *mrq)
 	host->mrq = mrq;
 
 	if (!present || host->flags & SDHCI_DEVICE_DEAD) {
-		host->mrq->cmd->error = -ENOMEDIUM;
+		mmc_set_mrq_error_code(host->mrq, -ENOMEDIUM);
 		tasklet_schedule(&host->finish_tasklet);
 	} else {
 		u32 present_state;
@@ -1420,10 +1624,13 @@ static void sdhci_request(struct mmc_host *mmc, struct mmc_request *mrq)
 			}
 		}
 
-		if (mrq->sbc && !(host->flags & SDHCI_AUTO_CMD23))
+		if (!host->uhsii_if_enabled && mrq->sbc &&
+				!(host->flags & SDHCI_AUTO_CMD23))
 			sdhci_send_command(host, mrq->sbc);
-		else
+		else if (mrq->cmd)
 			sdhci_send_command(host, mrq->cmd);
+		else if (mrq->tlp)
+			sdhci_send_native_tlp(host, mrq->tlp);
 	}
 
 	mmiowb();
@@ -1506,7 +1713,8 @@ static void sdhci_do_set_ios(struct sdhci_host *host, struct mmc_ios *ios)
 		!(host->quirks2 & SDHCI_QUIRK2_PRESET_VALUE_BROKEN))
 		sdhci_enable_preset_value(host, false);
 
-	if (!ios->clock || ios->clock != host->clock) {
+	if (!host->uhsii_if_enabled &&
+		(!ios->clock || ios->clock != host->clock)) {
 		host->ops->set_clock(host, ios->clock);
 		host->clock = ios->clock;
 
@@ -1523,7 +1731,8 @@ static void sdhci_do_set_ios(struct sdhci_host *host, struct mmc_ios *ios)
 		}
 	}
 
-	sdhci_set_power(host, ios->power_mode, ios->vdd);
+	if (!(host->uhsii_if_enabled && (ios->power_mode != MMC_POWER_OFF)))
+		sdhci_set_power(host, ios->power_mode, ios->vdd);
 
 	if (host->ops->platform_send_init_74_clocks)
 		host->ops->platform_send_init_74_clocks(host, ios->power_mode);
@@ -1585,10 +1794,12 @@ static void sdhci_do_set_ios(struct sdhci_host *host, struct mmc_ios *ios)
 			host->ops->set_clock(host, host->clock);
 		}
 
-		/* Reset SD Clock Enable */
-		clk = sdhci_readw(host, SDHCI_CLOCK_CONTROL);
-		clk &= ~SDHCI_CLOCK_CARD_EN;
-		sdhci_writew(host, clk, SDHCI_CLOCK_CONTROL);
+		if (!host->uhsii_if_enabled) {
+			/* Reset SD Clock Enable */
+			clk = sdhci_readw(host, SDHCI_CLOCK_CONTROL);
+			clk &= ~SDHCI_CLOCK_CARD_EN;
+			sdhci_writew(host, clk, SDHCI_CLOCK_CONTROL);
+		}
 
 		host->ops->set_uhs_signaling(host, ios->timing);
 		host->timing = ios->timing;
@@ -1608,7 +1819,8 @@ static void sdhci_do_set_ios(struct sdhci_host *host, struct mmc_ios *ios)
 		}
 
 		/* Re-enable SD Clock */
-		host->ops->set_clock(host, host->clock);
+		if (!host->uhsii_if_enabled)
+			host->ops->set_clock(host, host->clock);
 	} else
 		sdhci_writeb(host, ctrl, SDHCI_HOST_CONTROL);
 
@@ -2217,11 +2429,163 @@ static void sdhci_card_event(struct mmc_host *mmc)
 		sdhci_do_reset(host, SDHCI_RESET_CMD);
 		sdhci_do_reset(host, SDHCI_RESET_DATA);
 
-		host->mrq->cmd->error = -ENOMEDIUM;
+		mmc_set_mrq_error_code(host->mrq, -ENOMEDIUM);
 		tasklet_schedule(&host->finish_tasklet);
 	}
 
 	spin_unlock_irqrestore(&host->lock, flags);
+}
+
+static int sdhci_switch_uhsii_if(struct mmc_host *mmc)
+{
+	struct sdhci_host *host = mmc_priv(mmc);
+	unsigned long flags;
+	int err = 0;
+	u32 present;
+	u16 clk, ctrl2;
+	u8 pwr;
+
+	host->uhsii_if_enabled = false;
+	spin_lock_irqsave(&host->lock, flags);
+
+	clk = SDHCI_CLOCK_INT_EN;
+	sdhci_writew(host, clk, SDHCI_CLOCK_CONTROL);
+
+	if (sdhci_checkw(host, SDHCI_CLOCK_CONTROL,
+			SDHCI_CLOCK_INT_STABLE,
+			SDHCI_CLOCK_INT_STABLE, 20) < 0) {
+		pr_err("%s: Internal clock not ready.\n",
+			mmc_hostname(host->mmc));
+		sdhci_dumpregs(host);
+		err = -ETIMEDOUT;
+		goto out;
+	}
+
+	ctrl2 = sdhci_readw(host, SDHCI_HOST_CONTROL2);
+	ctrl2 |= SDHCI_CTRL_UHSII_IF_ENABLE;
+	sdhci_writew(host, ctrl2, SDHCI_HOST_CONTROL2);
+
+	pwr = (SDHCI_POWER_ON | SDHCI_POWER_330) << SDHCI_VDD1_SHIFT;
+	pwr |= (SDHCI_POWER_ON | SDHCI_POWER_180) << SDHCI_VDD2_SHIFT;
+	sdhci_writeb(host, pwr, SDHCI_POWER_CONTROL);
+
+	ctrl2 |= SDHCI_CTRL_UHSII;
+	sdhci_writew(host, ctrl2, SDHCI_HOST_CONTROL2);
+
+	/* Wait Power Ramp Up Time */
+	spin_unlock_irqrestore(&host->lock, flags);
+	msleep(20);
+	spin_lock_irqsave(&host->lock, flags);
+
+	clk |= SDHCI_CLOCK_CARD_EN;
+	sdhci_writew(host, clk, SDHCI_CLOCK_CONTROL);
+
+	udelay(200);
+
+	present = sdhci_readl(host, SDHCI_PRESENT_STATE);
+	if (present & SDHCI_STBL_DETECT) {
+		if (sdhci_checkl(host, SDHCI_PRESENT_STATE,
+				SDHCI_LANE_SYNC,
+				SDHCI_LANE_SYNC, 20) < 0) {
+			pr_err("%s: UHS-II PHY is not initialized\n",
+				mmc_hostname(host->mmc));
+			sdhci_dumpregs(host);
+			err = -ETIMEDOUT;
+			goto out;
+		}
+		host->uhsii_if_enabled = true;
+	} else {
+		pr_info("%s: UHS-II IF is not detected\n",
+			mmc_hostname(host->mmc));
+		goto out;
+	}
+
+out:
+	if (!host->uhsii_if_enabled) {
+		pwr = SDHCI_POWER_330 << SDHCI_VDD1_SHIFT;
+		pwr |= SDHCI_POWER_180 << SDHCI_VDD2_SHIFT;
+		sdhci_writeb(host, pwr, SDHCI_POWER_CONTROL);
+
+		spin_unlock_irqrestore(&host->lock, flags);
+		msleep(100);
+		spin_lock_irqsave(&host->lock, flags);
+
+		ctrl2 = sdhci_readw(host, SDHCI_HOST_CONTROL2);
+		ctrl2 &= ~SDHCI_CTRL_UHSII_IF_ENABLE;
+		ctrl2 &= ~SDHCI_CTRL_UHS_MASK;
+		sdhci_writew(host, ctrl2, SDHCI_HOST_CONTROL2);
+
+		err = -ENXIO;
+	}
+
+	spin_unlock_irqrestore(&host->lock, flags);
+	return err;
+}
+
+static int sdhci_exit_dormant(struct mmc_host *mmc)
+{
+	struct sdhci_host *host = mmc_priv(mmc);
+	u16 clk;
+
+	clk = sdhci_readw(host, SDHCI_CLOCK_CONTROL);
+	clk |= SDHCI_CLOCK_CARD_EN;
+	sdhci_writew(host, clk, SDHCI_CLOCK_CONTROL);
+
+	udelay(200);
+
+	if (sdhci_checkl(host, SDHCI_PRESENT_STATE,
+			SDHCI_IN_DORMANT_STATE, 0, 100) < 0) {
+		pr_err("%s: Still in dormant state.\n",
+			mmc_hostname(host->mmc));
+		return -ETIMEDOUT;
+	}
+
+	return 0;
+}
+
+static void sdhci_set_uhsii_ios(struct mmc_host *mmc, struct mmc_uhsii_ios *ios)
+{
+	struct sdhci_host *host = mmc_priv(mmc);
+	u32 reg;
+
+	sdhci_runtime_pm_get(host);
+
+	/* speed range */
+	if (ios->flags & SETTING_SPEED_RANGE) {
+		reg = sdhci_readl(host,
+			host->uhsii_settings_ptr + SDHCI_UHSII_PHY_REG);
+		reg &= ~SDHCI_UHSII_RANGE_MASK;
+		reg |= (ios->speed_range << SDHCI_UHSII_RANGE_SHIFT) &
+			SDHCI_UHSII_RANGE_MASK;
+		sdhci_writel(host, reg,
+			host->uhsii_settings_ptr + SDHCI_UHSII_PHY_REG);
+	}
+
+	/* n_fcu */
+	if (ios->flags & SETTING_N_FCU) {
+		if (host->n_fcu) {
+			if (!ios->n_fcu || (ios->n_fcu > host->n_fcu))
+				ios->n_fcu = host->n_fcu;
+		}
+		reg = sdhci_readl(host,
+			host->uhsii_settings_ptr + SDHCI_UHSII_LINK_REG_L);
+		reg &= ~SDHCI_UHSII_N_FCU_MASK;
+		reg |= (ios->n_fcu << SDHCI_UHSII_N_FCU_SHIFT) &
+			SDHCI_UHSII_N_FCU_MASK;
+		sdhci_writel(host, reg,
+			host->uhsii_settings_ptr + SDHCI_UHSII_LINK_REG_L);
+	}
+
+	/* power control mode */
+	if (ios->flags & SETTING_PWR_CTL_MODE) {
+		reg = sdhci_readl(host,
+			host->uhsii_settings_ptr + SDHCI_UHSII_GENERAL_REG);
+		reg |= SDHCI_UHSII_LOW_PWR_MODE;
+		sdhci_writel(host, reg,
+			host->uhsii_settings_ptr + SDHCI_UHSII_GENERAL_REG);
+	}
+
+	sdhci_runtime_pm_put(host);
 }
 
 static const struct mmc_host_ops sdhci_ops = {
@@ -2237,7 +2601,10 @@ static const struct mmc_host_ops sdhci_ops = {
 	.prepare_hs400_tuning		= sdhci_prepare_hs400_tuning,
 	.execute_tuning			= sdhci_execute_tuning,
 	.card_event			= sdhci_card_event,
-	.card_busy	= sdhci_card_busy,
+	.card_busy			= sdhci_card_busy,
+	.switch_uhsii_if		= sdhci_switch_uhsii_if,
+	.exit_dormant			= sdhci_exit_dormant,
+	.set_uhsii_ios			= sdhci_set_uhsii_ios,
 };
 
 /*****************************************************************************\
@@ -2269,6 +2636,19 @@ static void sdhci_tasklet_finish(unsigned long param)
 
 	mrq = host->mrq;
 
+	if (mrq->tlp) {
+		if (mrq->tlp->cmd_type == UHSII_COMMAND_GO_DORMANT) {
+			/* Wait In Dormant State */
+			if (sdhci_checkl(host, SDHCI_PRESENT_STATE,
+					SDHCI_IN_DORMANT_STATE,
+					SDHCI_IN_DORMANT_STATE, 100) < 0) {
+				pr_err("%s: Not in dormant state.\n",
+					mmc_hostname(host->mmc));
+				mrq->tlp->error = -ETIMEDOUT;
+			}
+		}
+	}
+
 	/*
 	 * The controller needs a reset of internal state machines
 	 * upon error conditions.
@@ -2276,6 +2656,7 @@ static void sdhci_tasklet_finish(unsigned long param)
 	if (!(host->flags & SDHCI_DEVICE_DEAD) &&
 	    ((mrq->cmd && mrq->cmd->error) ||
 	     (mrq->sbc && mrq->sbc->error) ||
+	     (mrq->tlp && mrq->tlp->error) ||
 	     (mrq->data && ((mrq->data->error && !mrq->data->stop) ||
 			    (mrq->data->stop && mrq->data->stop->error))) ||
 	     (host->quirks & SDHCI_QUIRK_RESET_AFTER_REQUEST))) {
@@ -2294,6 +2675,7 @@ static void sdhci_tasklet_finish(unsigned long param)
 	host->mrq = NULL;
 	host->cmd = NULL;
 	host->data = NULL;
+	host->tlp = NULL;
 
 #ifndef SDHCI_USE_LEDS_CLASS
 	sdhci_deactivate_led(host);
@@ -2324,10 +2706,18 @@ static void sdhci_timeout_timer(unsigned long data)
 			host->data->error = -ETIMEDOUT;
 			sdhci_finish_data(host);
 		} else {
-			if (host->cmd)
-				host->cmd->error = -ETIMEDOUT;
-			else
-				host->mrq->cmd->error = -ETIMEDOUT;
+			if (host->cmd || host->mrq->cmd) {
+				if (host->cmd)
+					host->cmd->error = -ETIMEDOUT;
+				else
+					host->mrq->cmd->error = -ETIMEDOUT;
+			}
+			if (host->tlp || host->mrq->tlp) {
+				if (host->tlp)
+					host->tlp->error = -ETIMEDOUT;
+				else
+					host->mrq->tlp->error = -ETIMEDOUT;
+			}
 
 			tasklet_schedule(&host->finish_tasklet);
 		}
@@ -2357,15 +2747,35 @@ static void sdhci_tuning_timer(unsigned long data)
  *                                                                           *
 \*****************************************************************************/
 
-static void sdhci_cmd_irq(struct sdhci_host *host, u32 intmask, u32 *mask)
+static void sdhci_cmd_irq(struct sdhci_host *host, u32 intmask,
+	u32 uhsii_intmask, u32 *mask)
 {
-	BUG_ON(intmask == 0);
+	BUG_ON(!intmask && !uhsii_intmask);
 
-	if (!host->cmd) {
+	if (!host->cmd && !host->tlp) {
 		pr_err("%s: Got command interrupt 0x%08x even "
 			"though no command operation was in progress.\n",
 			mmc_hostname(host->mmc), (unsigned)intmask);
 		sdhci_dumpregs(host);
+		return;
+	}
+
+	if (host->tlp) {
+		if (uhsii_intmask & SDHCI_UHSII_INT_TIMEOUT)
+			host->tlp->error = -ETIMEDOUT;
+		else if (uhsii_intmask & (SDHCI_UHSII_INT_CRC |
+				SDHCI_UHSII_INT_HEADER |
+				SDHCI_UHSII_INT_RES |
+				SDHCI_UHSII_INT_UNRECOVERABLE))
+			host->tlp->error = -EILSEQ;
+
+		if (host->tlp->error) {
+			tasklet_schedule(&host->finish_tasklet);
+			return;
+		}
+
+		if (intmask & SDHCI_INT_RESPONSE)
+			sdhci_finish_native_tlp(host);
 		return;
 	}
 
@@ -2565,6 +2975,7 @@ static irqreturn_t sdhci_irq(int irq, void *dev_id)
 	irqreturn_t result = IRQ_NONE;
 	struct sdhci_host *host = dev_id;
 	u32 intmask, mask, unexpected = 0;
+	u32 uhsii_intmask = 0;
 	int max_loops = 16;
 
 	spin_lock(&host->lock);
@@ -2575,7 +2986,12 @@ static irqreturn_t sdhci_irq(int irq, void *dev_id)
 	}
 
 	intmask = sdhci_readl(host, SDHCI_INT_STATUS);
-	if (!intmask || intmask == 0xffffffff) {
+
+	if (host->flags & SDHCI_HOST_V4_ENABLED)
+		uhsii_intmask = sdhci_readl(host, SDHCI_UHSII_INT_STATUS);
+
+	if ((!intmask || intmask == 0xffffffff) &&
+			(!uhsii_intmask || uhsii_intmask == 0xffffffff)) {
 		result = IRQ_NONE;
 		goto out;
 	}
@@ -2619,9 +3035,13 @@ static irqreturn_t sdhci_irq(int irq, void *dev_id)
 			result = IRQ_WAKE_THREAD;
 		}
 
+		if (uhsii_intmask)
+			sdhci_writel(host, uhsii_intmask,
+				SDHCI_UHSII_INT_STATUS);
+
 		if (intmask & SDHCI_INT_CMD_MASK)
 			sdhci_cmd_irq(host, intmask & SDHCI_INT_CMD_MASK,
-				      &intmask);
+				uhsii_intmask, &intmask);
 
 		if (intmask & SDHCI_INT_DATA_MASK)
 			sdhci_data_irq(host, intmask & SDHCI_INT_DATA_MASK);
@@ -2945,7 +3365,7 @@ int sdhci_add_host(struct sdhci_host *host)
 	host->version = sdhci_readw(host, SDHCI_HOST_VERSION);
 	host->version = (host->version & SDHCI_SPEC_VER_MASK)
 				>> SDHCI_SPEC_VER_SHIFT;
-	if (host->version > SDHCI_SPEC_300) {
+	if (host->version > SDHCI_SPEC_400) {
 		pr_err("%s: Unknown controller version (%d). "
 			"You may experience problems.\n", mmc_hostname(mmc),
 			host->version);
@@ -3203,6 +3623,9 @@ int sdhci_add_host(struct sdhci_host *host)
 		caps[1] &= ~(SDHCI_SUPPORT_SDR104 | SDHCI_SUPPORT_SDR50 |
 		       SDHCI_SUPPORT_DDR50);
 
+	if (!(caps[1] & SDHCI_CAN_VDD2_180))
+		caps[1] &= ~SDHCI_SUPPORT_UHSII;
+
 	/* Any UHS-I mode in caps implies SDR12 and SDR25 support. */
 	if (caps[1] & (SDHCI_SUPPORT_SDR104 | SDHCI_SUPPORT_SDR50 |
 		       SDHCI_SUPPORT_DDR50))
@@ -3233,6 +3656,64 @@ int sdhci_add_host(struct sdhci_host *host)
 		!(host->quirks2 & SDHCI_QUIRK2_BROKEN_DDR50))
 		mmc->caps |= MMC_CAP_UHS_DDR50;
 
+	if (caps[1] & SDHCI_SUPPORT_UHSII) {
+		u32 uhsii_caps;
+		u16 ctrl2;
+
+		/* Set Host Version 4.00 Enable */
+		ctrl2 = sdhci_readw(host, SDHCI_HOST_CONTROL2);
+		ctrl2 |= SDHCI_CTRL_HOST_V4_ENABLE;
+		sdhci_writew(host, ctrl2, SDHCI_HOST_CONTROL2);
+		host->flags |= SDHCI_HOST_V4_ENABLED;
+
+		host->uhsii_settings_ptr = sdhci_readw(host,
+			SDHCI_UHSII_SETTINGS_PTR);
+		host->uhsii_caps_ptr = sdhci_readw(host,
+			SDHCI_UHSII_HOST_CAPS_PTR);
+
+		uhsii_caps = sdhci_readl(host,
+			host->uhsii_caps_ptr + SDHCI_UHSII_GENERAL_REG);
+
+		host->lane_mode = (uhsii_caps & SDHCI_UHSII_LANES_MASK) >>
+			SDHCI_UHSII_LANES_SHIFT;
+		host->max_gap = (uhsii_caps & SDHCI_UHSII_GAP_MASK) >>
+			SDHCI_UHSII_GAP_SHIFT;
+		host->max_dap = (uhsii_caps & SDHCI_UHSII_DAP_MASK) >>
+			SDHCI_UHSII_DAP_SHIFT;
+		DBG("lane_mode: 0x%x, max_gap: 0x%x, max_dap: 0x%x\n",
+			host->lane_mode, host->max_gap, host->max_dap);
+
+		uhsii_caps = sdhci_readl(host,
+			host->uhsii_caps_ptr + SDHCI_UHSII_PHY_REG);
+
+		host->n_lss_dir = (uhsii_caps & SDHCI_UHSII_LSS_DIR_MASK) >>
+			SDHCI_UHSII_LSS_DIR_SHIFT;
+		host->n_lss_syn = (uhsii_caps & SDHCI_UHSII_LSS_SYN_MASK) >>
+			SDHCI_UHSII_LSS_SYN_SHIFT;
+		host->speed_range = (uhsii_caps & SDHCI_UHSII_RANGE_MASK) >>
+			SDHCI_UHSII_RANGE_SHIFT;
+		DBG("n_lss_dir: 0x%x, n_lss_syn: 0x%x, speed_range: 0x%x\n",
+			host->n_lss_dir, host->n_lss_syn, host->speed_range);
+
+		uhsii_caps = sdhci_readl(host,
+			host->uhsii_caps_ptr + SDHCI_UHSII_LINK_REG_L);
+
+		host->n_fcu = (uhsii_caps & SDHCI_UHSII_N_FCU_MASK) >>
+			SDHCI_UHSII_N_FCU_SHIFT;
+		DBG("n_fcu: 0x%x\n", host->n_fcu);
+
+		uhsii_caps = sdhci_readl(host,
+			host->uhsii_caps_ptr + SDHCI_UHSII_LINK_REG_H);
+
+		host->n_data_gap = uhsii_caps & SDHCI_UHSII_DATA_GAP_MASK;
+		DBG("n_data_gap: 0x%x\n", host->n_data_gap);
+
+		mmc->caps |= MMC_CAP_UHSII;
+
+		if (host->speed_range == SDHCI_UHSII_RANGE_AB)
+			mmc->caps2 |= MMC_CAP2_UHSII_RANGE_AB;
+	}
+
 	/* Does the host need tuning for SDR50? */
 	if (caps[1] & SDHCI_USE_SDR50_TUNING)
 		host->flags |= SDHCI_SDR50_NEEDS_TUNING;
@@ -3248,6 +3729,16 @@ int sdhci_add_host(struct sdhci_host *host)
 		mmc->caps |= MMC_CAP_DRIVER_TYPE_C;
 	if (caps[1] & SDHCI_DRIVER_TYPE_D)
 		mmc->caps |= MMC_CAP_DRIVER_TYPE_D;
+
+	if (host->version == SDHCI_SPEC_400) {
+		mmc->lane_mode = host->lane_mode;
+		mmc->max_gap = host->max_gap;
+		mmc->max_dap = host->max_dap;
+		mmc->n_lss_dir = host->n_lss_dir;
+		mmc->n_lss_syn = host->n_lss_syn;
+		mmc->n_data_gap = host->n_data_gap;
+		mmc->n_fcu = host->n_fcu;
+	}
 
 	/* Initial value for re-tuning timer count */
 	host->tuning_count = (caps[1] & SDHCI_RETUNING_TIMER_COUNT_MASK) >>
@@ -3488,7 +3979,7 @@ void sdhci_remove_host(struct sdhci_host *host, int dead)
 			pr_err("%s: Controller removed during "
 				" transfer!\n", mmc_hostname(mmc));
 
-			host->mrq->cmd->error = -ENOMEDIUM;
+			mmc_set_mrq_error_code(host->mrq, -ENOMEDIUM);
 			tasklet_schedule(&host->finish_tasklet);
 		}
 

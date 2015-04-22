@@ -33,6 +33,25 @@ static u8 rts5249_get_ic_version(struct rtsx_pcr *pcr)
 	return val & 0x0F;
 }
 
+static void rts5249_sd40_auto_K_apm_offset(struct rtsx_pcr *pcr)
+{
+	u16 val1, val2;
+
+	if (pcr->ic_version == IC_VER_A) {
+		rtsx_pci_write_phy_register(pcr, 0x9E, 0x85);
+		rtsx_pci_write_phy_register(pcr, 0x85, 0x244B);
+		rtsx_pci_write_phy_register(pcr, 0x85, 0x244F);
+		rtsx_pci_write_phy_register(pcr, 0x9E, 0x80);
+	} else {
+		rtsx_pci_read_phy_register(pcr, 0x9E, &val1);
+		rtsx_pci_write_phy_register(pcr, 0x9E, val1 | 0x05);
+		rtsx_pci_read_phy_register(pcr, 0x85, &val2);
+		rtsx_pci_write_phy_register(pcr, 0x85, val2 & 0xFFFB);
+		rtsx_pci_write_phy_register(pcr, 0x85, val2 | 0x4);
+		rtsx_pci_write_phy_register(pcr, 0x9E, val1 & ~0x05);
+	}
+}
+
 static void rts5249_fill_driving(struct rtsx_pcr *pcr, u8 voltage)
 {
 	u8 driving_3v3[4][3] = {
@@ -214,7 +233,7 @@ static int rtsx_base_disable_auto_blink(struct rtsx_pcr *pcr)
 	return rtsx_pci_write_register(pcr, OLT_LED_CTL, 0x08, 0x00);
 }
 
-static int rtsx_base_card_power_on(struct rtsx_pcr *pcr, int card)
+static int rtsx_base_card_power_on_vdd1(struct rtsx_pcr *pcr, int card)
 {
 	int err;
 
@@ -241,11 +260,47 @@ static int rtsx_base_card_power_on(struct rtsx_pcr *pcr, int card)
 	return 0;
 }
 
+static int rtsx_base_card_power_on_vdd2(struct rtsx_pcr *pcr, int card)
+{
+	int err;
+
+	rtsx_pci_init_cmd(pcr);
+	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, CARD_PWR_CTL,
+		SD_POWER_MASK | SD_VIO_PWR_MASK,
+		SD_VCC_PARTIAL_POWER_ON | SD_VIO_PWR14_ON);
+	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, PWR_GATE_CTRL,
+			LDO3318_PWR_MASK, 0x02);
+	err = rtsx_pci_send_cmd(pcr, 100);
+	if (err < 0)
+		return err;
+
+	msleep(5);
+
+	rtsx_pci_init_cmd(pcr);
+	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, CARD_PWR_CTL,
+		SD_POWER_MASK | SD_VIO_PWR_MASK,
+		SD_VCC_POWER_ON | SD_VIO_PWR_ON);
+	err = rtsx_pci_send_cmd(pcr, 100);
+	if (err < 0)
+		return err;
+
+	return 0;
+}
+
+static int rtsx_base_card_power_on(struct rtsx_pcr *pcr, int card)
+{
+	if (pcr->use_vdd2)
+		return rtsx_base_card_power_on_vdd2(pcr, card);
+	else
+		return rtsx_base_card_power_on_vdd1(pcr, card);
+}
+
 static int rtsx_base_card_power_off(struct rtsx_pcr *pcr, int card)
 {
 	rtsx_pci_init_cmd(pcr);
 	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, CARD_PWR_CTL,
-			SD_POWER_MASK, SD_POWER_OFF);
+		SD_POWER_MASK | SD_VIO_PWR_MASK | SD40_PAD_ISO,
+		SD_POWER_OFF | SD_VIO_PWR_OFF);
 	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, PWR_GATE_CTRL,
 			LDO3318_PWR_MASK, 0x00);
 	return rtsx_pci_send_cmd(pcr, 100);
@@ -289,6 +344,229 @@ static int rtsx_base_switch_output_voltage(struct rtsx_pcr *pcr, u8 voltage)
 	return rtsx_pci_send_cmd(pcr, 100);
 }
 
+static int rts5249_init_sd40_hw_stage1(struct rtsx_pcr *pcr)
+{
+	int err;
+	u16 val = 0;
+
+	rtsx_pci_write_phy_register(pcr, 0x85, 0x2497);
+	rtsx_pci_write_phy_register(pcr, 0x90, 0x09C6);
+	rtsx_pci_write_phy_register(pcr, 0x82, 0x2508);
+	rtsx_pci_write_phy_register(pcr, 0x85, 0x2497);
+	if (pcr->ic_version >= IC_VER_D)
+		rtsx_pci_write_phy_register(pcr, 0x87, 0x7469);
+	else
+		rtsx_pci_write_phy_register(pcr, 0x87, 0x7C69);
+	rtsx_pci_write_phy_register(pcr, 0x88, 0x4820);
+	rtsx_pci_write_phy_register(pcr, 0x92, 0xE21D);
+	if (pcr->ic_version >= IC_VER_D) {
+		rtsx_pci_write_phy_register(pcr, 0x8A, 0x61CF);
+		rtsx_pci_write_phy_register(pcr, 0x9F, 0xFF24);
+		rtsx_pci_read_phy_register(pcr, 0x86, &val);
+		rtsx_pci_write_phy_register(pcr, 0x86, val | 0x0C);
+	} else {
+		rtsx_pci_write_phy_register(pcr, 0x8A, 0x61CD);
+		rtsx_pci_write_phy_register(pcr, 0x9F, 0xFF20);
+	}
+
+	rtsx_pci_init_cmd(pcr);
+
+	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD40_LDO_CTL, 0xFF, 0xF3);
+	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, CARD_PWR_CTL,
+			SD40_PAD_ISO, SD40_PAD_ISO);
+	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, CARD_CLK_EN,
+			SD40_CLK_EN | SD_CLK_EN, SD40_CLK_EN);
+	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, CARD_SELECT,
+			CARD_MOD_MASK, SD40_MOD_SEL);
+	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, EIDL_IN_OUT_CNT, 0xFF, 0xFF);
+	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD40_PHY_CAP + 4, 0xFF, 0x50);
+	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD40_CTRL,
+			0xFF, SD40_PHY_RST | SD40_PHY_ISO);
+	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD40_MISC, SCRAM_DIS_EN, 0);
+
+	err = rtsx_pci_send_cmd(pcr, 100);
+	if (err < 0)
+		return err;
+
+	msleep(100);
+
+	err = rtsx_pci_write_register(pcr, CLK_CTL, 0xFF, CHANGE_SD40_PCLK);
+	if (err < 0)
+		return err;
+
+	err = rtsx_pci_write_register(pcr, CLK_DIV, 0x0F, 0x03);
+	if (err < 0)
+		return err;
+
+	msleep(10);
+
+	rts5249_sd40_auto_K_apm_offset(pcr);
+
+	if (pcr->ic_version >= IC_VER_D) {
+		u16 auto_k;
+
+		rtsx_pci_read_phy_register(pcr, 0x9D, &val);
+		rtsx_pci_write_phy_register(pcr, 0x9D, val | (1 << 9));
+
+		rtsx_pci_read_phy_register(pcr, 0x80, &auto_k);
+
+		rtsx_pci_read_phy_register(pcr, 0x88, &val);
+		rtsx_pci_write_phy_register(pcr, 0x88,
+				(val & 0xFC3F) | (auto_k & 0x1E00));
+
+		rtsx_pci_read_phy_register(pcr, 0x90, &val);
+		rtsx_pci_write_phy_register(pcr, 0x90,
+				(val & 0xFC3F) | ((auto_k & 0xF0) << 2));
+
+		rtsx_pci_read_phy_register(pcr, 0x85, &val);
+		rtsx_pci_write_phy_register(pcr, 0x85, val & ~0x01);
+
+		rtsx_pci_read_phy_register(pcr, 0x9D, &val);
+		rtsx_pci_write_phy_register(pcr, 0x9D, val & ~(1 << 9));
+
+		rtsx_pci_read_phy_register(pcr, 0x9E, &val);
+		rtsx_pci_write_phy_register(pcr, 0x9E, val & 0xBFFF);
+	}
+
+	return 0;
+}
+
+static int rts5249_init_sd40_hw_stage2(struct rtsx_pcr *pcr)
+{
+	u16 phy = 0;
+
+	rtsx_pci_read_phy_register(pcr, 0x9E, &phy);
+	rtsx_pci_write_phy_register(pcr, 0x9E, phy | (1 << 13));
+
+	rtsx_pci_read_phy_register(pcr, 0x9F, &phy);
+	rtsx_pci_write_phy_register(pcr, 0x9F, (phy & 0xFF0F) | 0x78);
+
+	return 0;
+}
+
+static int rts5249_init_sd40_hw(struct rtsx_pcr *pcr, u8 stage)
+{
+	int err = 0;
+
+	if (stage == 1)
+		err = rts5249_init_sd40_hw_stage1(pcr);
+	else if (stage == 2)
+		err = rts5249_init_sd40_hw_stage2(pcr);
+
+	return err;
+}
+
+static int rts5249_enter_dormant(struct rtsx_pcr *pcr)
+{
+	u8 val;
+	int err;
+
+	rtsx_pci_write_register(pcr, SD40_CTRL,
+			SD40_GO_DORMANT, SD40_GO_DORMANT);
+
+	msleep(5);
+
+	rtsx_pci_read_register(pcr, SD40_STATUS3, &val);
+	if (val & SD40_DET) {
+		dev_dbg(&pcr->pci->dev, "enter dormant failed\n");
+	} else {
+		if (val & DLSM_STATE_MASK) {
+			rtsx_pci_init_cmd(pcr);
+			rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD40_CTRL,
+					SD40_DLSM_RST, SD40_DLSM_RST);
+			rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, CLK_CTL,
+					CHANGE_SD40_PCLK | CLK_LOW_FREQ,
+					CLK_LOW_FREQ);
+			rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD40_CTRL,
+					SD40_PHY_RST, 0);
+			rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD40_CTRL,
+					SD40_PHY_RST, SD40_PHY_RST);
+			rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, CLK_CTL,
+					0xFF, CHANGE_SD40_PCLK);
+			err = rtsx_pci_send_cmd(pcr, 100);
+			if (err)
+				return err;
+		}
+
+		if (pcr->ic_version >= IC_VER_D) {
+			rtsx_pci_update_phy(pcr, 0x9F, 0xF0FB, 0);
+			rtsx_pci_update_phy(pcr, 0x86, 0xFFF3, 0);
+		}
+	}
+
+	return 0;
+}
+
+static int rts5249_exit_dormant(struct rtsx_pcr *pcr)
+{
+	u8 val;
+	int err;
+	u8 *ptr;
+
+	if (pcr->ic_version >= IC_VER_D) {
+		rtsx_pci_update_phy(pcr, 0x9F, 0xFFFF, 0x0F04);
+		rtsx_pci_update_phy(pcr, 0x86, 0xFFFF, 0x0C);
+	}
+
+	rtsx_pci_read_register(pcr, CARD_PWR_CTL, &val);
+	if ((val & SD_POWER_MASK) == SD_POWER_OFF) {
+		dev_dbg(&(pcr->pci->dev), "set SD40 power on\n");
+		rtsx_pci_write_register(pcr, CARD_PWR_CTL, SD_POWER_MASK,
+				SD_VCC_PARTIAL_POWER_ON);
+		msleep(5);
+		rtsx_pci_write_register(pcr, CARD_PWR_CTL, SD_POWER_MASK,
+				SD_POWER_ON);
+		msleep(1);
+	}
+
+	rtsx_pci_init_cmd(pcr);
+	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD40_TMOUT_1,
+		SD40_TIME_OUT_ERR_EN, 0x00);
+	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD40_CTRL,
+		SD40_GO_DORMANT | SD40_EXIT_DORMANT,
+		SD40_EXIT_DORMANT);
+	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD40_TMOUT_1,
+		SD40_TIME_OUT_ERR_EN, SD40_TIME_OUT_ERR_EN);
+	err = rtsx_pci_send_cmd(pcr, 100);
+	if (err < 0)
+		return err;
+
+	msleep(5);
+
+	rtsx_pci_init_cmd(pcr);
+	rtsx_pci_add_cmd(pcr, READ_REG_CMD, SD40_STATUS1, 0, 0);
+	rtsx_pci_add_cmd(pcr, READ_REG_CMD, SD40_TMOUT_0, 0, 0);
+	rtsx_pci_add_cmd(pcr, READ_REG_CMD, SD40_TMOUT_1, 0, 0);
+	err = rtsx_pci_send_cmd(pcr, 100);
+	if (err < 0)
+		return err;
+
+	ptr = rtsx_pci_get_cmd_data(pcr);
+
+	if ((ptr[0] & (SD40_HEAD_ERR | SD40_FRAM_ERR | SD40_CRC_ERR)) ||
+			ptr[1] || (ptr[2] & 0x0F)) {
+		dev_dbg(&pcr->pci->dev, "exit dormant failed\n");
+		dev_dbg(&pcr->pci->dev, "SD40_STATUS1: 0x%02x\n", ptr[0]);
+		dev_dbg(&pcr->pci->dev, "SD40_TMOUT_0: 0x%02x\n", ptr[1]);
+		dev_dbg(&pcr->pci->dev, "SD40_TMOUT_1: 0x%02x\n", ptr[2]);
+		return -EIO;
+	}
+
+	return 0;
+}
+
+static int rts5249_set_dormant_state(struct rtsx_pcr *pcr, u8 state)
+{
+	if (state == RTSX_DORMANT_ENTER)
+		return rts5249_enter_dormant(pcr);
+	else if (state == RTSX_DORMANT_EXIT)
+		return rts5249_exit_dormant(pcr);
+	else
+		dev_dbg(&pcr->pci->dev, "unknown state\n");
+
+	return -EINVAL;
+}
+
 static const struct pcr_ops rts5249_pcr_ops = {
 	.fetch_vendor_settings = rtsx_base_fetch_vendor_settings,
 	.extra_init_hw = rts5249_extra_init_hw,
@@ -301,6 +579,8 @@ static const struct pcr_ops rts5249_pcr_ops = {
 	.card_power_off = rtsx_base_card_power_off,
 	.switch_output_voltage = rtsx_base_switch_output_voltage,
 	.force_power_down = rtsx_base_force_power_down,
+	.init_sd40_hw = rts5249_init_sd40_hw,
+	.set_dormant_state = rts5249_set_dormant_state,
 };
 
 /* SD Pull Control Enable:
@@ -315,6 +595,13 @@ static const u32 rts5249_sd_pull_ctl_enable_tbl[] = {
 	RTSX_REG_PAIR(CARD_PULL_CTL2, 0xAA),
 	RTSX_REG_PAIR(CARD_PULL_CTL3, 0xE9),
 	RTSX_REG_PAIR(CARD_PULL_CTL4, 0xAA),
+	0,
+};
+
+static const u32 rts5249_sd40_pull_ctl_enable_tbl[] = {
+	RTSX_REG_PAIR(CARD_PULL_CTL1, 0x66),
+	RTSX_REG_PAIR(CARD_PULL_CTL2, 0x10),
+	RTSX_REG_PAIR(CARD_PULL_CTL3, 0xE5),
 	0,
 };
 
@@ -357,7 +644,8 @@ static const u32 rts5249_ms_pull_ctl_disable_tbl[] = {
 
 void rts5249_init_params(struct rtsx_pcr *pcr)
 {
-	pcr->extra_caps = EXTRA_CAPS_SD_SDR50 | EXTRA_CAPS_SD_SDR104;
+	pcr->extra_caps = EXTRA_CAPS_SD_SDR50 | EXTRA_CAPS_SD_SDR104 |
+		EXTRA_CAPS_SD_UHSII | EXTRA_CAPS_SD_UHSII_RANGE_B;
 	pcr->num_slots = 2;
 	pcr->ops = &rts5249_pcr_ops;
 
@@ -372,9 +660,10 @@ void rts5249_init_params(struct rtsx_pcr *pcr)
 	pcr->ic_version = rts5249_get_ic_version(pcr);
 	pcr->sd_pull_ctl_enable_tbl = rts5249_sd_pull_ctl_enable_tbl;
 	pcr->sd_pull_ctl_disable_tbl = rts5249_sd_pull_ctl_disable_tbl;
+	pcr->sd40_pull_ctl_enable_tbl = rts5249_sd40_pull_ctl_enable_tbl;
+	pcr->sd40_pull_ctl_disable_tbl = rts5249_sd_pull_ctl_disable_tbl;
 	pcr->ms_pull_ctl_enable_tbl = rts5249_ms_pull_ctl_enable_tbl;
 	pcr->ms_pull_ctl_disable_tbl = rts5249_ms_pull_ctl_disable_tbl;
-
 	pcr->reg_pm_ctrl3 = PM_CTRL3;
 }
 

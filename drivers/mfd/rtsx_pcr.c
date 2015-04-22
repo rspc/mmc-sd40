@@ -78,6 +78,12 @@ static inline void rtsx_pci_disable_aspm(struct rtsx_pcr *pcr)
 		0xFC, 0);
 }
 
+static inline void rtsx_pci_disable_bus_int(struct rtsx_pcr *pcr)
+{
+	rtsx_pci_writel(pcr, RTSX_BIER, 0);
+	pcr->bier = 0;
+}
+
 void rtsx_pci_start_run(struct rtsx_pcr *pcr)
 {
 	/* If pci device removed, don't queue idle work any more */
@@ -583,7 +589,9 @@ int rtsx_pci_card_pull_ctl_enable(struct rtsx_pcr *pcr, int card)
 {
 	const u32 *tbl;
 
-	if (card == RTSX_SD_CARD)
+	if (pcr->use_vdd2 && pcr->sd40_pull_ctl_enable_tbl)
+		tbl = pcr->sd40_pull_ctl_enable_tbl;
+	else if (card == RTSX_SD_CARD)
 		tbl = pcr->sd_pull_ctl_enable_tbl;
 	else if (card == RTSX_MS_CARD)
 		tbl = pcr->ms_pull_ctl_enable_tbl;
@@ -598,13 +606,14 @@ int rtsx_pci_card_pull_ctl_disable(struct rtsx_pcr *pcr, int card)
 {
 	const u32 *tbl;
 
-	if (card == RTSX_SD_CARD)
+	if (pcr->use_vdd2 && pcr->sd40_pull_ctl_disable_tbl)
+		tbl = pcr->sd40_pull_ctl_disable_tbl;
+	else if (card == RTSX_SD_CARD)
 		tbl = pcr->sd_pull_ctl_disable_tbl;
 	else if (card == RTSX_MS_CARD)
 		tbl = pcr->ms_pull_ctl_disable_tbl;
 	else
 		return -EINVAL;
-
 
 	return rtsx_pci_set_pull_ctl(pcr, tbl);
 }
@@ -788,6 +797,24 @@ int rtsx_pci_switch_output_voltage(struct rtsx_pcr *pcr, u8 voltage)
 }
 EXPORT_SYMBOL_GPL(rtsx_pci_switch_output_voltage);
 
+int rtsx_pci_set_dormant_state(struct rtsx_pcr *pcr, u8 state)
+{
+	if (pcr->ops->set_dormant_state)
+		return pcr->ops->set_dormant_state(pcr, state);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(rtsx_pci_set_dormant_state);
+
+int rtsx_pci_init_sd40_hw(struct rtsx_pcr *pcr, u8 stage)
+{
+	if (pcr->ops->init_sd40_hw)
+		return pcr->ops->init_sd40_hw(pcr, stage);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(rtsx_pci_init_sd40_hw);
+
 unsigned int rtsx_pci_card_exist(struct rtsx_pcr *pcr)
 {
 	unsigned int val;
@@ -880,6 +907,7 @@ static irqreturn_t rtsx_pci_isr(int irq, void *dev_id)
 	spin_lock(&pcr->lock);
 
 	int_reg = rtsx_pci_readl(pcr, RTSX_BIPR);
+	pcr_dbg(pcr, "---------- RTSX BIPR %08X ----------\n", int_reg);
 	/* Clear interrupt flag */
 	rtsx_pci_writel(pcr, RTSX_BIPR, int_reg);
 	if ((int_reg & pcr->bier) == 0) {
@@ -979,9 +1007,7 @@ static void rtsx_pci_power_off(struct rtsx_pcr *pcr, u8 pm_state)
 	if (pcr->ops->turn_off_led)
 		pcr->ops->turn_off_led(pcr);
 
-	rtsx_pci_writel(pcr, RTSX_BIER, 0);
-	pcr->bier = 0;
-
+	rtsx_pci_disable_bus_int(pcr);
 	rtsx_pci_write_register(pcr, PETXCFG, 0x08, 0x08);
 	rtsx_pci_write_register(pcr, HOST_SLEEP_STATE, 0x03, pm_state);
 
@@ -1295,12 +1321,7 @@ static void rtsx_pci_remove(struct pci_dev *pcidev)
 
 	pcr->remove_pci = true;
 
-	/* Disable interrupts at the pcr level */
-	spin_lock_irq(&pcr->lock);
-	rtsx_pci_writel(pcr, RTSX_BIER, 0);
-	pcr->bier = 0;
-	spin_unlock_irq(&pcr->lock);
-
+	rtsx_pci_disable_bus_int(pcr);
 	cancel_delayed_work_sync(&pcr->carddet_work);
 	cancel_delayed_work_sync(&pcr->idle_work);
 
@@ -1341,8 +1362,9 @@ static int rtsx_pci_suspend(struct pci_dev *pcidev, pm_message_t state)
 	handle = pci_get_drvdata(pcidev);
 	pcr = handle->pcr;
 
-	cancel_delayed_work(&pcr->carddet_work);
-	cancel_delayed_work(&pcr->idle_work);
+	rtsx_pci_disable_bus_int(pcr);
+	cancel_delayed_work_sync(&pcr->carddet_work);
+	cancel_delayed_work_sync(&pcr->idle_work);
 
 	mutex_lock(&pcr->pcr_mutex);
 

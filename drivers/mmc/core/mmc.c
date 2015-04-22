@@ -1187,14 +1187,10 @@ static int mmc_hs200_tuning(struct mmc_card *card)
 
 /*
  * Handle the detection and initialisation of a card.
- *
- * In the case of a resume, "oldcard" will contain the card
- * we're trying to reinitialise.
  */
-static int mmc_init_card(struct mmc_host *host, u32 ocr,
-	struct mmc_card *oldcard)
+static int mmc_do_init_card(struct mmc_host *host, u32 ocr,
+		struct mmc_card *card, bool reinit)
 {
-	struct mmc_card *card;
 	int err;
 	u32 cid[4];
 	u32 rocr;
@@ -1239,23 +1235,13 @@ static int mmc_init_card(struct mmc_host *host, u32 ocr,
 	if (err)
 		goto err;
 
-	if (oldcard) {
-		if (memcmp(cid, oldcard->raw_cid, sizeof(cid)) != 0) {
+	if (reinit) {
+		if (memcmp(cid, card->raw_cid, sizeof(cid)) != 0) {
 			err = -ENOENT;
 			goto err;
 		}
-
-		card = oldcard;
 	} else {
-		/*
-		 * Allocate card structure.
-		 */
-		card = mmc_alloc_card(host, &mmc_type);
-		if (IS_ERR(card)) {
-			err = PTR_ERR(card);
-			goto err;
-		}
-
+		card->dev.type = &mmc_type;
 		card->ocr = ocr;
 		card->type = MMC_TYPE_MMC;
 		card->rca = 1;
@@ -1279,7 +1265,7 @@ static int mmc_init_card(struct mmc_host *host, u32 ocr,
 		mmc_set_bus_mode(host, MMC_BUSMODE_PUSHPULL);
 	}
 
-	if (!oldcard) {
+	if (!reinit) {
 		/*
 		 * Fetch CSD from card.
 		 */
@@ -1311,7 +1297,7 @@ static int mmc_init_card(struct mmc_host *host, u32 ocr,
 			goto free_card;
 	}
 
-	if (!oldcard) {
+	if (!reinit) {
 		/* Read extended CSD. */
 		err = mmc_read_ext_csd(card);
 		if (err)
@@ -1487,16 +1473,23 @@ static int mmc_init_card(struct mmc_host *host, u32 ocr,
 		}
 	}
 
-	if (!oldcard)
-		host->card = card;
-
 	return 0;
 
-free_card:
-	if (!oldcard)
-		mmc_remove_card(card);
+free_card:				/* reserve this label to reduce diff */
 err:
 	return err;
+}
+
+static inline int mmc_init_card(struct mmc_host *host, u32 ocr,
+		struct mmc_card *card)
+{
+	return mmc_do_init_card(host, ocr, card, false);
+}
+
+static inline int mmc_reinit_card(struct mmc_host *host, u32 ocr,
+		struct mmc_card *card)
+{
+	return mmc_do_init_card(host, ocr, card, true);
 }
 
 static int mmc_can_sleep(struct mmc_card *card)
@@ -1700,7 +1693,7 @@ static int _mmc_resume(struct mmc_host *host)
 		goto out;
 
 	mmc_power_up(host, host->card->ocr);
-	err = mmc_init_card(host, host->card->ocr, host->card);
+	err = mmc_reinit_card(host, host->card->ocr, host->card);
 	mmc_card_clr_suspended(host->card);
 
 out:
@@ -1787,7 +1780,7 @@ static int mmc_power_restore(struct mmc_host *host)
 	int ret;
 
 	mmc_claim_host(host);
-	ret = mmc_init_card(host, host->card->ocr, host->card);
+	ret = mmc_reinit_card(host, host->card->ocr, host->card);
 	mmc_release_host(host);
 
 	return ret;
@@ -1851,11 +1844,14 @@ static const struct mmc_bus_ops mmc_ops = {
  */
 int mmc_attach_mmc(struct mmc_host *host)
 {
+	struct mmc_card *card;
 	int err;
 	u32 ocr, rocr;
 
-	BUG_ON(!host);
+	BUG_ON(!host && !host->card);
 	WARN_ON(!host->claimed);
+
+	card = host->card;
 
 	/* Set correct bus mode for MMC before attempting attach */
 	if (!mmc_host_is_spi(host))
@@ -1891,7 +1887,7 @@ int mmc_attach_mmc(struct mmc_host *host)
 	/*
 	 * Detect and init the card.
 	 */
-	err = mmc_init_card(host, rocr, NULL);
+	err = mmc_init_card(host, rocr, card);
 	if (err)
 		goto err;
 
@@ -1899,15 +1895,10 @@ int mmc_attach_mmc(struct mmc_host *host)
 	err = mmc_add_card(host->card);
 	mmc_claim_host(host);
 	if (err)
-		goto remove_card;
+		goto err;
 
 	return 0;
 
-remove_card:
-	mmc_release_host(host);
-	mmc_remove_card(host->card);
-	mmc_claim_host(host);
-	host->card = NULL;
 err:
 	mmc_detach_bus(host);
 

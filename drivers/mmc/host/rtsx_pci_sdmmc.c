@@ -44,6 +44,7 @@ struct realtek_pci_sdmmc {
 	struct work_struct	work;
 	struct mutex		host_mutex;
 
+	u8			dma_packet_size;
 	u8			ssc_depth;
 	unsigned int		clock;
 	bool			vpclk;
@@ -96,9 +97,107 @@ static void sd_print_debug_regs(struct realtek_pci_sdmmc *host)
 	dump_reg_range(host, 0xFDA0, 0xFDB3);
 	dump_reg_range(host, 0xFD52, 0xFD69);
 }
+
+static void sd40_print_debug_regs(struct realtek_pci_sdmmc *host)
+{
+	struct rtsx_pcr *pcr = host->pcr;
+	u8 val;
+
+	dump_reg_range(host, 0xE030, 0xE038);
+	dump_reg_range(host, 0xFC00, 0xFC05);
+	dump_reg_range(host, 0xEC2B, 0xEC6A);
+
+	rtsx_pci_read_register(pcr, SD40_TRAN, &val);
+	if (val & SD40_TRANS_ERR) {
+		rtsx_pci_read_register(pcr, STATUS_BASE + 2, &val);
+		if (val & RETRY_EXPIRE)
+			dev_dbg(sdmmc_dev(host), "retry expire\n");
+		rtsx_pci_read_register(pcr, SD40_TIMEOUT_0, &val);
+		if (val & SD40_T_CMD_RSP_OUT)
+			dev_dbg(sdmmc_dev(host), "cmd response timeout\n");
+		rtsx_pci_read_register(pcr, SD40_STATUS1, &val);
+		if (val & (SD40_HEAD_ERR | SD40_FRAM_ERR | SD40_CRC_ERR))
+			dev_dbg(sdmmc_dev(host), "crc error\n");
+		rtsx_pci_read_register(pcr, SD40_RX_ARG, &val);
+		if (val & RES_NAK)
+			dev_dbg(sdmmc_dev(host), "CMD NAK!\n");
+	}
+}
+
 #else
 #define sd_print_debug_regs(host)
+#define sd40_print_debug_regs(host)
 #endif /* DEBUG */
+
+static inline void sd40_clear_error(struct realtek_pci_sdmmc *host)
+{
+	struct rtsx_pcr *pcr = host->pcr;
+	rtsx_pci_write_register(pcr, SD40_CTRL, SD40_MAC_RST, SD40_MAC_RST);
+	rtsx_pci_write_register(pcr, DMACTL, DMA_RST, DMA_RST);
+	rtsx_pci_write_register(pcr, DMATC0, 0xFF, 0x00);
+	rtsx_pci_write_register(pcr, DMATC1, 0xFF, 0x00);
+	rtsx_pci_write_register(pcr, DMATC2, 0xFF, 0x00);
+	rtsx_pci_write_register(pcr, DMATC3, 0xFF, 0x00);
+}
+
+static inline u8 sd40_dma_packet_size(u8 n_fcu)
+{
+	switch (n_fcu) {
+	case 2:
+		return DMA_1024;
+	case 4:
+		return DMA_2048;
+	case 8:
+		return DMA_4096;
+	case 16:
+		return DMA_8192;
+	case 32:
+		return DMA_16384;
+	case 64:
+		return DMA_32768;
+	default:
+		return DMA_512;
+	}
+}
+
+static int sd_reset_sd40_module(struct realtek_pci_sdmmc *host)
+{
+	struct rtsx_pcr *pcr = host->pcr;
+	u8 val;
+
+	/* reset to speed range A */
+	rtsx_pci_read_register(pcr, SD40_PHY_SET + 0, &val);
+	rtsx_pci_write_register(pcr, SD40_PHY_SET + 0,
+			0xFF, val & 0x3F);
+	rtsx_pci_init_cmd(pcr);
+
+
+	/* Switch clock to CRC clock */
+	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, CLK_CTL,
+			CHANGE_SD40_PCLK | CLK_LOW_FREQ, CLK_LOW_FREQ);
+
+	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD40_CTRL,
+			SD40_MAC_RST, SD40_MAC_RST);
+
+	/* Disable and reset SD40 PHY */
+	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD40_CTRL,
+			SD40_PHY_RST | SD40_PHY_ISO |
+			SD40_DLSM_RST | SD40_TSSM_RST,
+			SD40_DLSM_RST | SD40_TSSM_RST);
+
+	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD40_GEN_SET + 7,
+			0x80, 0x00);
+	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, CARD_CLK_EN,
+			SD_CLK_EN | SD40_CLK_EN, SD_CLK_EN);
+	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, CARD_SELECT,
+			CARD_MOD_MASK, SD_MOD_SEL);
+	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD40_LDO_CTL,
+			SD40_LDO12AS_MASK, SD40_LD012AS_OFF);
+	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, CARD_PWR_CTL,
+			SD40_PAD_ISO, 0x00);
+
+	return rtsx_pci_send_cmd(pcr, 100);
+}
 
 static inline int sd_get_cd_int(struct realtek_pci_sdmmc *host)
 {
@@ -570,6 +669,224 @@ static int sd_rw_multi(struct realtek_pci_sdmmc *host, struct mmc_request *mrq)
 	return sd_write_long_data(host, mrq);
 }
 
+static void sd_add_tlp_block(struct rtsx_pcr *pcr, struct mmc_tlp_block *tlpblk,
+		u8 plen)
+{
+	int i;
+
+	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD40_TX_HDR0, 0xFF,
+			(u8)(tlpblk->header >> 8));
+	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD40_TX_HDR1, 0xFF,
+			(u8)tlpblk->header);
+
+	if (tlpblk->header & UHSII_HD_NP) {
+		if (UHSII_CHK_CCMD(tlpblk->header)) {
+			rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD40_TX_ARG0, 0xFF,
+					(u8)(tlpblk->argument >> 8));
+			rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD40_TX_ARG1, 0xFF,
+					(u8)tlpblk->argument);
+		} else {
+			rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD40_TX_ARG2, 0xFF,
+					(u8)(tlpblk->argument >> 8));
+		}
+	} else {
+		if (UHSII_CHK_CCMD(tlpblk->header)) {
+			/* Set PLEN */
+			rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD40_TX_ARG0, 0x30,
+					0x10);
+			rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD40_TX_ARG3, 0xFF,
+					(u8)tlpblk->argument);
+		} else {
+			/* Set DIR */
+			rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD40_TX_ARG0, 0x80,
+					(u8)(tlpblk->argument >> 8));
+			rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD40_TX_ARG2, 0xFF,
+					(u8)(tlpblk->argument >> 8));
+			rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD40_TX_ARG3, 0xFF,
+					(u8)tlpblk->argument);
+		}
+	}
+
+	if (!(tlpblk->header & UHSII_HD_NP) ||
+			(tlpblk->argument & UHSII_ARG_DIR_WRITE)) {
+		for (i = 0; i < UHSII_PLEN_DWORDS(plen); i++)
+			rtsx_pci_write_be32(pcr, SD40_TX_PLD_DW0 + 4 * i,
+				swab32(tlpblk->payload[i]));
+	}
+
+	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD40_TRAN, 0xFF, SD40_TRANS_START);
+	rtsx_pci_add_cmd(pcr, CHECK_REG_CMD, SD40_TRAN,
+			SD_TRANSFER_END, SD_TRANSFER_END);
+
+	if (UHSII_CHK_CCMD(tlpblk->header)) {
+		rtsx_pci_add_cmd(pcr, READ_REG_CMD, SD40_RX_HDR, 0, 0);
+		rtsx_pci_add_cmd(pcr, READ_REG_CMD, SD40_RX_HDR + 1, 0, 0);
+		rtsx_pci_add_cmd(pcr, READ_REG_CMD, SD40_RX_ARG, 0, 0);
+		rtsx_pci_add_cmd(pcr, READ_REG_CMD, SD40_RX_ARG + 1, 0, 0);
+		for (i = 0; i < UHSII_PLEN_BYTES(plen); i++)
+			rtsx_pci_add_cmd(pcr, READ_REG_CMD,
+					SD40_RX_PLD_DW0 + i, 0, 0);
+	}
+}
+
+static void sd_send_native_ccmd(struct realtek_pci_sdmmc *host,
+		struct mmc_tlp *tlp)
+{
+	struct rtsx_pcr *pcr = host->pcr;
+	u8 plen = (u8)UHSII_GET_PLEN(tlp->tlp_send);
+	int i, err;
+	u8 *ptr;
+
+	rtsx_pci_init_cmd(pcr);
+	sd_add_tlp_block(pcr, tlp->tlp_send, plen);
+	err = rtsx_pci_send_cmd(pcr, 300);
+	if (err < 0) {
+		tlp->error = err;
+		sd40_print_debug_regs(host);
+		sd40_clear_error(host);
+		dev_dbg(sdmmc_dev(host), "error: send native tlp %d\n", err);
+		return;
+	}
+
+	ptr = rtsx_pci_get_cmd_data(pcr) + 1;
+	tlp->tlp_back->header = get_unaligned_be16(ptr);
+	ptr += 2;
+	tlp->tlp_back->argument = get_unaligned_be16(ptr);
+	ptr += 2;
+	for (i = 0; i < UHSII_PLEN_DWORDS(plen); i++) {
+		tlp->tlp_back->payload[i] = get_unaligned_le32(ptr);
+		ptr += 4;
+	}
+}
+
+static void sd_send_sdtran_ccmd(struct realtek_pci_sdmmc *host,
+		struct mmc_request *mrq)
+{
+	struct rtsx_pcr *pcr = host->pcr;
+	struct mmc_command *cmd = mrq->cmd;
+	u8 plen = cmd->flags & MMC_RSP_136 ? 4 : 1;
+	u16 back_header;
+	u16 back_arg;
+	int i, err;
+	u8 *ptr;
+
+	rtsx_pci_init_cmd(pcr);
+	sd_add_tlp_block(pcr, &(cmd->tlp_send), plen);
+	err = rtsx_pci_send_cmd(pcr, 300);
+	if (err < 0) {
+		cmd->error = err;
+		sd40_print_debug_regs(host);
+		sd40_clear_error(host);
+		dev_dbg(sdmmc_dev(host), "error: send sdtran ccmd %d\n", err);
+		return;
+	}
+
+	ptr = rtsx_pci_get_cmd_data(pcr) + 1;
+
+	back_header = get_unaligned_le16(ptr);
+	ptr += 2;
+	back_arg = get_unaligned_le16(ptr);
+	ptr += 2;
+
+	if (back_arg & UHSII_ARG_RES_NACK) {
+		dev_dbg(sdmmc_dev(host), "response NACK!\n");
+		cmd->error = -EIO;
+		return;
+	}
+
+	if (cmd->flags & MMC_RSP_PRESENT) {
+		if (cmd->flags & MMC_RSP_136) {
+			for (i = 0; i < 4; i++) {
+				cmd->resp[i] = get_unaligned_le32(ptr);
+				ptr += 4;
+			}
+		} else {
+			cmd->resp[0] = get_unaligned_le32(ptr);
+		}
+	}
+}
+
+static int sd_send_sdtran_dcmd(struct realtek_pci_sdmmc *host,
+		struct mmc_request *mrq)
+{
+	struct rtsx_pcr *pcr = host->pcr;
+	struct mmc_command *cmd = mrq->cmd;
+	struct mmc_data *data = mrq->data;
+	size_t data_len = data->blksz * data->blocks;
+	int read = (data->flags & MMC_DATA_READ) ? 1 : 0;
+	u8 tmode = (u8)UHSII_GET_TMODE(&cmd->tlp_send);
+	u8 plen = 2;
+	int err = 0;
+
+	rtsx_pci_init_cmd(pcr);
+	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD40_EBSY, 0xC3,
+		SD40_HAS_EBSY | SD40_WAIT_EBSY | SD40_STAT_EBSY_TMOUT);
+	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, IRQSTAT0,
+			DMA_DONE_INT, DMA_DONE_INT);
+	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, DMATC3,
+			0xFF, (u8)(data_len >> 24));
+	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, DMATC2,
+			0xFF, (u8)(data_len >> 16));
+	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, DMATC1,
+			0xFF, (u8)(data_len >> 8));
+	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, DMATC0, 0xFF, (u8)data_len);
+	if (read) {
+		rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, DMACTL,
+				0x03 | DMA_PACK_SIZE_MASK,
+				DMA_DIR_FROM_CARD | DMA_EN |
+				host->dma_packet_size);
+	} else {
+		rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, DMACTL,
+				0x03 | DMA_PACK_SIZE_MASK,
+				DMA_DIR_TO_CARD | DMA_EN |
+				host->dma_packet_size);
+	}
+
+	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, CARD_DATA_SOURCE,
+			0x01, RING_BUFFER);
+
+	if (tmode & UHSII_TMODE_LM_SPECIFIED) {
+		rtsx_pci_add_cmd(pcr, WRITE_REG_CMD,
+				SD40_LINK_SET + 2, 0xF0, 0x00);
+		rtsx_pci_add_cmd(pcr, WRITE_REG_CMD,
+				SD40_LINK_SET + 3, 0xFF, 0x20);
+	} else {
+		if (data_len & 0x1FF) {
+			rtsx_pci_add_cmd(pcr, WRITE_REG_CMD,
+					SD40_LINK_SET + 2,
+					0xF0, (u8)(data_len << 4));
+			rtsx_pci_add_cmd(pcr, WRITE_REG_CMD,
+					SD40_LINK_SET + 3,
+					0xFF, (u8)(data_len >> 4));
+		} else {
+			rtsx_pci_add_cmd(pcr, WRITE_REG_CMD,
+					SD40_LINK_SET + 2, 0xF0, 0x00);
+			rtsx_pci_add_cmd(pcr, WRITE_REG_CMD,
+					SD40_LINK_SET + 3, 0xFF, 0x20);
+		}
+
+		rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD40_TRAN_LEN_0,
+				0xFF, (u8)(data->blocks));
+		rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD40_TRAN_LEN_1,
+				0xFF, (u8)(data->blocks >> 8));
+	}
+
+	sd_add_tlp_block(pcr, &(cmd->tlp_send), plen);
+
+	rtsx_pci_send_cmd_no_wait(pcr);
+
+	err = rtsx_pci_transfer_data(pcr, data->sg, data->sg_len, read, 10000);
+	if (err) {
+		data->error = err;
+		rtsx_pci_stop_cmd(host->pcr);
+		sd_print_debug_regs(host);
+		sd40_print_debug_regs(host);
+		sd40_clear_error(host);
+	}
+	rtsx_pci_write_register(pcr, SD40_EBSY, 0xC3, 0);
+	return err;
+}
+
 static inline void sd_enable_initial_mode(struct realtek_pci_sdmmc *host)
 {
 	rtsx_pci_write_register(host->pcr, SD_CFG1,
@@ -783,6 +1100,32 @@ static int sd_tuning_rx(struct realtek_pci_sdmmc *host, u8 opcode)
 	return 0;
 }
 
+static void sdmmc_send_native_cmd(struct mmc_host *mmc, struct mmc_request *mrq)
+{
+	struct realtek_pci_sdmmc *host = mmc_priv(mmc);
+	struct mmc_tlp *tlp = mrq->tlp;
+
+	/* __NOTE__: 5249E should set SD40_DUMMY1 */
+	if (UHSII_CHK_CCMD(tlp->tlp_send->header))
+		sd_send_native_ccmd(host, tlp);
+	else
+		dev_err(sdmmc_dev(host), "error: native DCMD not defined\n");
+
+	if (tlp->cmd_type == UHSII_COMMAND_GO_DORMANT)
+		rtsx_pci_set_dormant_state(host->pcr, RTSX_DORMANT_ENTER);
+}
+
+static void sdmmc_send_sdtran_cmd(struct mmc_host *mmc, struct mmc_request *mrq)
+{
+	struct realtek_pci_sdmmc *host = mmc_priv(mmc);
+	struct mmc_command *cmd = mrq->cmd;
+
+	if (UHSII_CHK_CCMD(cmd->tlp_send.header))
+		sd_send_sdtran_ccmd(host, mrq);
+	else
+		sd_send_sdtran_dcmd(host, mrq);
+}
+
 static inline int sdio_extblock_cmd(struct mmc_command *cmd,
 	struct mmc_data *data)
 {
@@ -796,44 +1139,13 @@ static inline int sd_rw_cmd(struct mmc_command *cmd)
 		(cmd->opcode == MMC_WRITE_BLOCK);
 }
 
-static void sd_request(struct work_struct *work)
+static void sdmmc_send_legacy_cmd(struct mmc_host *mmc, struct mmc_request *mrq)
 {
-	struct realtek_pci_sdmmc *host = container_of(work,
-			struct realtek_pci_sdmmc, work);
-	struct rtsx_pcr *pcr = host->pcr;
-
-	struct mmc_host *mmc = host->mmc;
-	struct mmc_request *mrq = host->mrq;
+	struct realtek_pci_sdmmc *host = mmc_priv(mmc);
 	struct mmc_command *cmd = mrq->cmd;
 	struct mmc_data *data = mrq->data;
 
 	unsigned int data_size = 0;
-	int err;
-
-	if (host->eject || !sd_get_cd_int(host)) {
-		cmd->error = -ENOMEDIUM;
-		goto finish;
-	}
-
-	err = rtsx_pci_card_exclusive_check(host->pcr, RTSX_SD_CARD);
-	if (err) {
-		cmd->error = err;
-		goto finish;
-	}
-
-	mutex_lock(&pcr->pcr_mutex);
-
-	rtsx_pci_start_run(pcr);
-
-	rtsx_pci_switch_clock(pcr, host->clock, host->ssc_depth,
-			host->initial_mode, host->double_clk, host->vpclk);
-	rtsx_pci_write_register(pcr, CARD_SELECT, 0x07, SD_MOD_SEL);
-	rtsx_pci_write_register(pcr, CARD_SHARE_MODE,
-			CARD_SHARE_MASK, CARD_SHARE_48_SD);
-
-	mutex_lock(&host->host_mutex);
-	host->mrq = mrq;
-	mutex_unlock(&host->host_mutex);
 
 	if (mrq->data)
 		data_size = data->blocks * data->blksz;
@@ -850,9 +1162,114 @@ static void sd_request(struct work_struct *work)
 	} else {
 		sd_normal_rw(host, mrq);
 	}
+}
+
+static int sd_select_card(struct realtek_pci_sdmmc *host)
+{
+	struct rtsx_pcr *pcr = host->pcr;
+	u8 val;
+
+	rtsx_pci_read_register(pcr, CARD_SELECT, &val);
+
+	if ((val & CARD_MOD_MASK) != SD_MOD_SEL) {
+		dev_dbg(sdmmc_dev(host), "%s: original card selected %d\n",
+			__func__, val);
+		rtsx_pci_write_register(pcr, CARD_SELECT, CARD_MOD_MASK,
+				SD_MOD_SEL);
+	}
+
+	rtsx_pci_read_register(pcr, CARD_SHARE_MODE, &val);
+
+	if ((val & CARD_SHARE_MASK) != CARD_SHARE_48_SD) {
+		dev_dbg(sdmmc_dev(host), "%s: original card share mode %d\n",
+			__func__, val);
+		rtsx_pci_write_register(pcr, CARD_SHARE_MODE, CARD_SHARE_MASK,
+				CARD_SHARE_48_SD);
+	}
+
+	return 0;
+}
+
+static int sd40_select_card(struct realtek_pci_sdmmc *host)
+{
+	struct rtsx_pcr *pcr = host->pcr;
+	u8 val;
+
+	rtsx_pci_read_register(pcr, CARD_SELECT, &val);
+
+	if ((val & CARD_MOD_MASK) != SD40_MOD_SEL) {
+		dev_dbg(sdmmc_dev(host), "%s: original card selected %d\n",
+			__func__, val);
+		rtsx_pci_write_register(pcr, CARD_SELECT, CARD_MOD_MASK,
+				SD40_MOD_SEL);
+	}
+
+	rtsx_pci_read_register(pcr, CARD_SHARE_MODE, &val);
+
+	if ((val & CARD_SHARE_MASK) != CARD_SHARE_48_SD) {
+		dev_dbg(sdmmc_dev(host), "%s: original card share mode %d\n",
+			__func__, val);
+		rtsx_pci_write_register(pcr, CARD_SHARE_MODE, CARD_SHARE_MASK,
+				CARD_SHARE_48_SD);
+	}
+
+	return 0;
+}
+
+static void sd_request(struct work_struct *work)
+{
+	struct realtek_pci_sdmmc *host = container_of(work,
+			struct realtek_pci_sdmmc, work);
+	struct rtsx_pcr *pcr = host->pcr;
+
+	struct mmc_host *mmc = host->mmc;
+	struct mmc_request *mrq = host->mrq;
+	struct mmc_data *data = mrq->data;
+	int err;
+
+	if (host->eject || !sd_get_cd_int(host)) {
+		mmc_set_mrq_error_code(mrq, -ENOMEDIUM);
+		goto finish;
+	}
+
+	err = rtsx_pci_card_exclusive_check(host->pcr, RTSX_SD_CARD);
+	if (err) {
+		mmc_set_mrq_error_code(mrq, err);
+		goto finish;
+	}
+
+	if (unlikely(host->power_state != SDMMC_POWER_ON)) {
+		dev_err(sdmmc_dev(host), "handle request before power on\n");
+		mmc_set_mrq_error_code(mrq, -EIO);
+		goto finish;
+	}
+
+	mutex_lock(&pcr->pcr_mutex);
+
+	rtsx_pci_start_run(pcr);
+
+	if (mmc_card_uhsii(mmc->card)) {
+		sd40_select_card(host);
+	} else {
+		rtsx_pci_switch_clock(pcr, host->clock, host->ssc_depth,
+				host->initial_mode, host->double_clk,
+				host->vpclk);
+		sd_select_card(host);
+	}
+
+	mutex_lock(&host->host_mutex);
+	host->mrq = mrq;
+	mutex_unlock(&host->host_mutex);
+
+	if (mrq->tlp)
+		sdmmc_send_native_cmd(mmc, mrq);
+	else if (mrq->cmd->use_tlp)
+		sdmmc_send_sdtran_cmd(mmc, mrq);
+	else
+		sdmmc_send_legacy_cmd(mmc, mrq);
 
 	if (mrq->data) {
-		if (cmd->error || data->error)
+		if (mmc_get_mrq_error_code(mrq) || data->error)
 			data->bytes_xfered = 0;
 		else
 			data->bytes_xfered = data->blocks * data->blksz;
@@ -861,11 +1278,6 @@ static void sd_request(struct work_struct *work)
 	mutex_unlock(&pcr->pcr_mutex);
 
 finish:
-	if (cmd->error) {
-		dev_dbg(sdmmc_dev(host), "CMD %d 0x%08x error(%d)\n",
-			cmd->opcode, cmd->arg, cmd->error);
-	}
-
 	mutex_lock(&host->host_mutex);
 	host->mrq = NULL;
 	mutex_unlock(&host->host_mutex);
@@ -882,7 +1294,8 @@ static void sdmmc_request(struct mmc_host *mmc, struct mmc_request *mrq)
 	host->mrq = mrq;
 	mutex_unlock(&host->host_mutex);
 
-	if (sd_rw_cmd(mrq->cmd) || sdio_extblock_cmd(mrq->cmd, data))
+	if (!mrq->tlp &&
+		(sd_rw_cmd(mrq->cmd) || sdio_extblock_cmd(mrq->cmd, data)))
 		host->using_cookie = sd_pre_dma_transfer(host, data, false);
 
 	queue_work(host->workq, &host->work);
@@ -905,20 +1318,33 @@ static int sd_set_bus_width(struct realtek_pci_sdmmc *host,
 	return err;
 }
 
-static int sd_power_on(struct realtek_pci_sdmmc *host)
+static int sd_power_on(struct realtek_pci_sdmmc *host, bool use_vdd2)
 {
 	struct rtsx_pcr *pcr = host->pcr;
 	int err;
 
+	dev_dbg(sdmmc_dev(host), "%s: power_state = %d, use_vdd2 = %d\n",
+			__func__, host->power_state, use_vdd2);
+
 	if (host->power_state == SDMMC_POWER_ON)
 		return 0;
 
+	pcr->use_vdd2 = use_vdd2;
+
 	rtsx_pci_init_cmd(pcr);
-	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, CARD_SELECT, 0x07, SD_MOD_SEL);
+	if (use_vdd2) {
+		rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, CARD_SELECT,
+				0x07, SD40_MOD_SEL);
+		rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, CARD_CLK_EN,
+				SD40_CLK_EN, SD40_CLK_EN);
+	} else {
+		rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, CARD_SELECT,
+				0x07, SD_MOD_SEL);
+		rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, CARD_CLK_EN,
+				SD_CLK_EN, SD_CLK_EN);
+	}
 	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, CARD_SHARE_MODE,
 			CARD_SHARE_MASK, CARD_SHARE_48_SD);
-	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, CARD_CLK_EN,
-			SD_CLK_EN, SD_CLK_EN);
 	err = rtsx_pci_send_cmd(pcr, 100);
 	if (err < 0)
 		return err;
@@ -936,19 +1362,25 @@ static int sd_power_on(struct realtek_pci_sdmmc *host)
 		return err;
 
 	host->power_state = SDMMC_POWER_ON;
+	dev_dbg(sdmmc_dev(host), "---------- power on ----------\n");
+
 	return 0;
 }
 
 static int sd_power_off(struct realtek_pci_sdmmc *host)
 {
 	struct rtsx_pcr *pcr = host->pcr;
-	int err;
+	int err = 0;
 
 	host->power_state = SDMMC_POWER_OFF;
 
-	rtsx_pci_init_cmd(pcr);
+	err = sd_reset_sd40_module(host);
+	if (err < 0)
+		return err;
 
-	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, CARD_CLK_EN, SD_CLK_EN, 0);
+	rtsx_pci_init_cmd(pcr);
+	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, CARD_CLK_EN,
+			SD_CLK_EN | SD40_CLK_EN, 0);
 	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, CARD_OE, SD_OUTPUT_EN, 0);
 
 	err = rtsx_pci_send_cmd(pcr, 100);
@@ -959,18 +1391,31 @@ static int sd_power_off(struct realtek_pci_sdmmc *host)
 	if (err < 0)
 		return err;
 
-	return rtsx_pci_card_pull_ctl_disable(pcr, RTSX_SD_CARD);
+	err = rtsx_pci_card_pull_ctl_disable(pcr, RTSX_SD_CARD);
+	if (err < 0)
+		return err;
+
+	dev_dbg(sdmmc_dev(host), "---------- power off ----------\n");
+	return 0;
 }
 
 static int sd_set_power_mode(struct realtek_pci_sdmmc *host,
 		unsigned char power_mode)
 {
 	int err;
+	bool use_vdd2 = false;
+
+	if (host->mmc->card && mmc_card_uhsii(host->mmc->card))
+		use_vdd2 = true;
 
 	if (power_mode == MMC_POWER_OFF)
 		err = sd_power_off(host);
 	else
-		err = sd_power_on(host);
+		err = sd_power_on(host, use_vdd2);
+
+	if (err)
+		dev_dbg(sdmmc_dev(host), "set power_mode = %d failed\n",
+			power_mode);
 
 	return err;
 }
@@ -1086,11 +1531,14 @@ static void sdmmc_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
 		break;
 	}
 
-	host->initial_mode = (ios->clock <= 1000000) ? true : false;
+	if (mmc->card) {
+		host->initial_mode = (ios->clock <= 1000000) ? true : false;
 
-	host->clock = ios->clock;
-	rtsx_pci_switch_clock(pcr, ios->clock, host->ssc_depth,
-			host->initial_mode, host->double_clk, host->vpclk);
+		host->clock = ios->clock;
+		rtsx_pci_switch_clock(pcr, ios->clock, host->ssc_depth,
+				host->initial_mode, host->double_clk,
+				host->vpclk);
+	}
 
 	mutex_unlock(&pcr->pcr_mutex);
 }
@@ -1225,8 +1673,9 @@ static int sdmmc_switch_voltage(struct mmc_host *mmc, struct mmc_ios *ios)
 	int err = 0;
 	u8 voltage;
 
-	dev_dbg(sdmmc_dev(host), "%s: signal_voltage = %d\n",
-			__func__, ios->signal_voltage);
+	dev_dbg(sdmmc_dev(host), "signal_voltage = %s\n",
+		ios->signal_voltage ==
+		MMC_SIGNAL_VOLTAGE_330 ? "3.3V" : "1.8V");
 
 	if (host->eject)
 		return -ENOMEDIUM;
@@ -1321,6 +1770,162 @@ out:
 	return err;
 }
 
+static int sd_prepare_switch_uhsii_if(struct realtek_pci_sdmmc *host)
+{
+	struct rtsx_pcr *pcr = host->pcr;
+	struct mmc_ios ios = {0};
+
+	ios.bus_width = MMC_BUS_WIDTH_1;
+	ios.power_mode = MMC_POWER_ON;
+	ios.timing = MMC_TIMING_LEGACY;
+	ios.clock = 0;
+	sdmmc_set_ios(host->mmc, &ios);
+
+	ios.signal_voltage = MMC_SIGNAL_VOLTAGE_330;
+	sdmmc_switch_voltage(host->mmc, &ios);
+
+	mutex_lock(&pcr->pcr_mutex);
+	rtsx_pci_write_register(pcr, SD_CFG1, 0xFF,
+			SD_CLK_DIVIDE_128 | SD_20_MODE | SD_BUS_WIDTH_1BIT);
+	rtsx_pci_write_register(pcr, SD_SAMPLE_POINT_CTL, 0xFF,
+			SD20_RX_POS_EDGE);
+	rtsx_pci_write_register(pcr, SD_PUSH_POINT_CTL, 0xFF, 0x00);
+	rtsx_pci_write_register(pcr, CARD_STOP, SD_STOP | SD_CLR_ERR,
+			SD_STOP | SD_CLR_ERR);
+	rtsx_pci_write_register(pcr, SD_CFG3, SD30_CLK_END_EN, SD30_CLK_END_EN);
+	rtsx_pci_write_register(pcr, SD_STOP_CLK_CFG,
+			SD30_CLK_STOP_CFG_EN | SD30_CLK_STOP_CFG1 |
+			SD30_CLK_STOP_CFG0,
+			SD30_CLK_STOP_CFG_EN | SD30_CLK_STOP_CFG1 |
+			SD30_CLK_STOP_CFG0);
+	sd_select_card(host);
+	mutex_unlock(&pcr->pcr_mutex);
+
+	return 0;
+}
+
+static int sdmmc_switch_uhsii_if(struct mmc_host *mmc)
+{
+	struct realtek_pci_sdmmc *host = mmc_priv(mmc);
+	struct rtsx_pcr *pcr = host->pcr;
+	int err = 0;
+	u8 val = 0;
+
+	if (host->eject)
+		return -ENOMEDIUM;
+
+	err = rtsx_pci_card_exclusive_check(pcr, RTSX_SD_CARD);
+	if (err)
+		return err;
+
+	sd_prepare_switch_uhsii_if(host);
+
+	mutex_lock(&pcr->pcr_mutex);
+	rtsx_pci_start_run(pcr);
+
+	err = rtsx_pci_init_sd40_hw(pcr, 1);
+	if (err)
+		goto out;
+
+	err = rtsx_pci_write_register(pcr, SD40_TMOUT_1,
+			SD40_TIME_OUT_ERR_EN, 0x00);
+	if (err)
+		goto out;
+
+	err = rtsx_pci_write_register(pcr, SD40_CTRL,
+			SD40_GO_HIBERNATE, SD40_GO_HIBERNATE);
+	if (err)
+		goto out;
+
+	udelay(2);
+
+	rtsx_pci_init_cmd(pcr);
+
+	val = SD40_PHY_RST | SD40_PHY_ISO |
+		SD40_EXIT_DORMANT | SD40_GO_HIBERNATE;
+	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD40_CTRL, 0xFF, val);
+	rtsx_pci_add_cmd(pcr, CHECK_REG_CMD, SD40_STATUS3,
+			DLSM_STATE_MASK, 0x20);
+
+	err = rtsx_pci_send_cmd(pcr, 100);
+	if (err < 0) {
+		rtsx_pci_read_register(pcr, SD40_TRAN, &val);
+		if (val == 0x80)
+			dev_dbg(sdmmc_dev(host), "SD40_STATUS3:STB.L failed\n");
+		else if (val == 0x10)
+			dev_dbg(sdmmc_dev(host), "SD40_STATUS3:SYNC failed\n");
+		else
+			dev_dbg(sdmmc_dev(host), "SD40_STATUS3 check failed\n");
+		rtsx_pci_write_register(pcr, SD40_TMOUT_1,
+				SD40_TIME_OUT_ERR_EN, SD40_TIME_OUT_ERR_EN);
+		goto out;
+	}
+
+	rtsx_pci_write_register(pcr, SD40_TMOUT_1,
+			SD40_TIME_OUT_ERR_EN, SD40_TIME_OUT_ERR_EN);
+
+	err = rtsx_pci_init_sd40_hw(pcr, 2);
+	if (err)
+		goto out;
+
+	mutex_unlock(&pcr->pcr_mutex);
+	dev_dbg(sdmmc_dev(host), "switch to UHSII interface\n");
+
+	return 0;
+
+out:
+	sd_power_off(host);
+	mutex_unlock(&pcr->pcr_mutex);
+
+	dev_dbg(sdmmc_dev(host), "switch to legacy interface\n");
+	return err;
+}
+
+static inline int sdmmc_exit_dormant(struct mmc_host *mmc)
+{
+	struct realtek_pci_sdmmc *host = mmc_priv(mmc);
+	int err;
+
+	sd40_clear_error(host);
+
+	err = rtsx_pci_set_dormant_state(host->pcr, RTSX_DORMANT_EXIT);
+	if (err)
+		sd40_print_debug_regs(host);
+
+	sd40_clear_error(host);
+	return err;
+}
+
+static void sdmmc_set_uhsii_ios(struct mmc_host *mmc, struct mmc_uhsii_ios *ios)
+{
+	struct realtek_pci_sdmmc *host = mmc_priv(mmc);
+	struct rtsx_pcr *pcr = host->pcr;
+	u8 val;
+
+	/* speed range */
+	if (ios->flags & SETTING_SPEED_RANGE) {
+		val = ios->speed_range << SD40_SPEED_RANGE_SHIFT;
+		rtsx_pci_write_register(pcr, SD40_PHY_SET + 0,
+				SD40_SPEED_RANGE_MASK, val);
+	}
+
+	/* n_fcu */
+	if (ios->flags & SETTING_N_FCU) {
+		if (mmc->n_fcu) {
+			if (!ios->n_fcu || (ios->n_fcu > mmc->n_fcu))
+				ios->n_fcu = mmc->n_fcu;
+		}
+		rtsx_pci_write_register(pcr, SD40_LINK_SET + 1,
+				0xFF, ios->n_fcu);
+		host->dma_packet_size = sd40_dma_packet_size(ios->n_fcu);
+	}
+
+	/* power control mode */
+	if (ios->flags & SETTING_PWR_CTL_MODE)
+		rtsx_pci_write_register(pcr, SD40_GEN_SET + 0,
+				SD40_LOW_POWER_MODE, SD40_LOW_POWER_MODE);
+}
+
 static const struct mmc_host_ops realtek_pci_sdmmc_ops = {
 	.pre_req = sdmmc_pre_req,
 	.post_req = sdmmc_post_req,
@@ -1330,6 +1935,9 @@ static const struct mmc_host_ops realtek_pci_sdmmc_ops = {
 	.get_cd = sdmmc_get_cd,
 	.start_signal_voltage_switch = sdmmc_switch_voltage,
 	.execute_tuning = sdmmc_execute_tuning,
+	.switch_uhsii_if = sdmmc_switch_uhsii_if,
+	.exit_dormant = sdmmc_exit_dormant,
+	.set_uhsii_ios = sdmmc_set_uhsii_ios,
 };
 
 static void init_extra_caps(struct realtek_pci_sdmmc *host)
@@ -1349,6 +1957,10 @@ static void init_extra_caps(struct realtek_pci_sdmmc *host)
 		mmc->caps |= MMC_CAP_1_8V_DDR;
 	if (pcr->extra_caps & EXTRA_CAPS_MMC_8BIT)
 		mmc->caps |= MMC_CAP_8_BIT_DATA;
+	if (pcr->extra_caps & EXTRA_CAPS_SD_UHSII)
+		mmc->caps |= MMC_CAP_UHSII;
+	if (pcr->extra_caps & EXTRA_CAPS_SD_UHSII_RANGE_B)
+		mmc->caps2 |= MMC_CAP2_UHSII_RANGE_AB;
 }
 
 static void realtek_init_host(struct realtek_pci_sdmmc *host)
@@ -1373,6 +1985,14 @@ static void realtek_init_host(struct realtek_pci_sdmmc *host)
 	mmc->max_blk_size = 512;
 	mmc->max_blk_count = 65535;
 	mmc->max_req_size = 524288;
+
+	mmc->lane_mode = 0;
+	mmc->max_gap = 8;
+	mmc->max_dap = 8;
+	mmc->n_lss_dir = 0;
+	mmc->n_lss_syn = 0;
+	mmc->n_data_gap = 0;
+	mmc->n_fcu = 8;
 }
 
 static void rtsx_pci_sdmmc_card_event(struct platform_device *pdev)
@@ -1451,8 +2071,7 @@ static int rtsx_pci_sdmmc_drv_remove(struct platform_device *pdev)
 			mmc_hostname(mmc));
 
 		rtsx_pci_complete_unfinished_transfer(pcr);
-
-		host->mrq->cmd->error = -ENOMEDIUM;
+		mmc_set_mrq_error_code(host->mrq, -ENOMEDIUM);
 		if (host->mrq->stop)
 			host->mrq->stop->error = -ENOMEDIUM;
 		mmc_request_done(mmc, host->mrq);

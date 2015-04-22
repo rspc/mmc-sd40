@@ -78,6 +78,23 @@ struct mmc_ios {
 #define MMC_SET_DRIVER_TYPE_D	3
 };
 
+struct mmc_uhsii_ios {
+	u8 speed_range;
+#define SD_UHSII_SPEED_RANGE_A		0
+#define SD_UHSII_SPEED_RANGE_B		1
+
+	u8 n_fcu;
+
+	u8 pwr_ctl_mode;
+#define SD_UHSII_PWR_CTL_FAST_MODE	0
+#define SD_UHSII_PWR_CTL_LOW_PWR_MODE	1
+
+	u32 flags;
+#define SETTING_SPEED_RANGE		(1 << 0)
+#define SETTING_N_FCU			(1 << 1)
+#define SETTING_PWR_CTL_MODE		(1 << 2)
+};
+
 struct mmc_host_ops {
 	/*
 	 * It is optional for the host to implement pre_req and post_req in
@@ -135,6 +152,10 @@ struct mmc_host_ops {
 	void	(*hw_reset)(struct mmc_host *host);
 	void	(*card_event)(struct mmc_host *host);
 
+	int	(*switch_uhsii_if)(struct mmc_host *host);
+	int	(*exit_dormant)(struct mmc_host *host);
+	void	(*set_uhsii_ios)(struct mmc_host *host,
+			struct mmc_uhsii_ios *ios);
 	/*
 	 * Optional callback to support controllers with HW issues for multiple
 	 * I/O. Returns the number of supported blocks for the request.
@@ -257,6 +278,7 @@ struct mmc_host {
 #define MMC_CAP_UHS_SDR104	(1 << 18)	/* Host supports UHS SDR104 mode */
 #define MMC_CAP_UHS_DDR50	(1 << 19)	/* Host supports UHS DDR50 mode */
 #define MMC_CAP_RUNTIME_RESUME	(1 << 20)	/* Resume at runtime_resume. */
+#define MMC_CAP_UHSII		(1 << 21)	/* Host supports UHS-II mode */
 #define MMC_CAP_DRIVER_TYPE_A	(1 << 23)	/* Host supports Driver Type A */
 #define MMC_CAP_DRIVER_TYPE_C	(1 << 24)	/* Host supports Driver Type C */
 #define MMC_CAP_DRIVER_TYPE_D	(1 << 25)	/* Host supports Driver Type D */
@@ -285,6 +307,8 @@ struct mmc_host {
 				 MMC_CAP2_HS400_1_2V)
 #define MMC_CAP2_HSX00_1_2V	(MMC_CAP2_HS200_1_2V_SDR | MMC_CAP2_HS400_1_2V)
 #define MMC_CAP2_SDIO_IRQ_NOTHREAD (1 << 17)
+#define MMC_CAP2_UHSII_RANGE_AB	(1 << 18)	/* Supported speed range */
+#define MMC_CAP2_UHSII_LOW_PWR	(1 << 19)	/* Support UHS-II low power */
 
 	mmc_pm_flag_t		pm_caps;	/* supported pm features */
 
@@ -299,6 +323,15 @@ struct mmc_host {
 	struct device_attribute clkgate_delay_attr;
 	unsigned long           clkgate_delay;
 #endif
+
+	u8			lane_mode;
+	u8			max_gap;
+	u8			max_dap;
+	u8			n_data_gap;
+	u8			n_fcu;
+	u8			n_lss_dir;
+	u8			n_lss_syn;
+	struct mmc_uhsii_ios	uhsii_ios;
 
 	/* host specific block data */
 	unsigned int		max_seg_size;	/* see blk_queue_max_segment_size */

@@ -91,4 +91,77 @@
 #define SD_SWITCH_ACCESS_DEF	0
 #define SD_SWITCH_ACCESS_HS	1
 
+#define UHSII_IOADR(base, reg)			(((u16)(base) << 8) | (reg))
+#define UHSII_IOADR_BASE(arg)			(((arg) >> 8) & 0x0F)
+#define UHSII_IOADR_OFFSET(arg)			((arg) & 0xFF)
+
+/* IOADR of Generic Capabilities Register (DW) */
+#define SD40_IOADR_GEN_CAP_L			0x00
+#define SD40_IOADR_GEN_CAP_H			0x01
+
+/* IOADR of PHY Capabilities Register (DW)  */
+#define SD40_IOADR_PHY_CAP_L			0x02
+#define SD40_IOADR_PHY_CAP_H			0x03
+
+/* IOADR LINK/TRAN Capabilities Register (DW) */
+#define SD40_IOADR_LINK_CAP_L			0x04
+#define SD40_IOADR_LINK_CAP_H			0x05
+
+#define SD40_IOADR_GEN_SET_L			0x08
+#define SD40_IOADR_GEN_SET_H			0x09
+
+#define SD40_IOADR_PHY_SET_L			0x0A
+#define SD40_IOADR_PHY_SET_H			0x0B
+
+#define SD40_IOADR_LINK_SET_L			0x0C
+#define SD40_IOADR_LINK_SET_H			0x0D
+
+/* Node ID (First or Last) ENUMERATE */
+#define SD40_IDL_SHIFT				24
+#define SD40_IDL_MASK				(0x0F << SD40_IDL_SHIFT)
+
+/* SD40 I/O Address space offset */
+#define SD40_IOADR_CFG_BASE			0x00  /*000h : 0FFh*/
+#define SD40_IOADR_INT_BASE			0x01  /*100h : 17Fh*/
+#define SD40_IOADR_ST_BASE			0x01  /*180h : 1FFh*/
+#define SD40_IOADR_CMD_BASE			0x02  /*200h : 2FFh*/
+#define SD40_IOADR_VENDOR_BASE			0x0F  /*F00h : FFFh*/
+
+/* Command Register (CMD_REG).  DW, Base on IOADR_CMD_BASE */
+#define SD40_FULL_RESET				0x00
+#define SD40_GO_DORMANT_STATE			0x01
+#define SD40_DEVICE_INIT			0x02
+#define SD40_ENUMERATE				0x03
+#define SD40_TRANS_ABORT			0x04
+
+/* DEVICE_INIT */
+#define SD40_GD_SHIFT				28
+#define SD40_GD_MASK				(0x0F << SD40_GD_SHIFT)
+#define SD40_GAP_SHIFT				24
+#define SD40_GAP_MASK				(0x0F << SD40_GAP_SHIFT)
+#define SD40_DAP_SHIFT				20
+#define SD40_DAP_MASK				(0x0F << SD40_DAP_SHIFT)
+#define SD40_CF					0x80000
+
+#define SD40_GD(val)		(((val) << SD40_GD_SHIFT) & SD40_GD_MASK)
+#define SD40_GAP(val)		(((val) << SD40_GAP_SHIFT) & SD40_GAP_MASK)
+#define SD40_DAP(val)		(((val) << SD40_DAP_SHIFT) & SD40_DAP_MASK)
+
+/* Generic Capabilities Register */
+#define SD40_LANE_MODE_SHIFT			8
+#define SD40_LANE_MODE_MASK			(0x3F << SD40_LANE_MODE_SHIFT)
+#define SD40_LANE_MODE_2L_HD			0x01
+#define SD40_LANE_MODE_2D1U_FD			0x02
+#define SD40_LANE_MODE_1D2U_FD			0x04
+#define SD40_LANE_MODE_2D2U_FD			0x08
+
+#define SD40_APP_TYPE_MASK			0x07
+#define SD40_APP_TYPE_SD_MEMORY			0x01
+#define SD40_APP_TYPE_SDIO			0x02
+#define SD40_APP_TYPE_EMBEDDED			0x04
+
+/* Generic Settings Register */
+#define SD40_CONFIG_COMPLETE			0x80000000
+#define SD40_LOW_PWR_MODE			0x01
+
 #endif /* LINUX_MMC_SD_H */

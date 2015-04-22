@@ -707,6 +707,38 @@ struct device_type sd_type = {
 	.groups = sd_std_groups,
 };
 
+static int mmc_sd_switch_uhsii_if(struct mmc_host *host)
+{
+	int err = 0;
+
+	if (!(host->caps & MMC_CAP_UHSII) || !host->ops->switch_uhsii_if)
+		return -ENXIO;
+
+	mmc_host_clk_hold(host);
+	err = host->ops->switch_uhsii_if(host);
+	mmc_host_clk_release(host);
+
+	if (!err)
+		host->ios.power_mode = MMC_POWER_ON;
+
+	mmc_delay(10);
+	return err;
+}
+
+static int mmc_sd_exit_dormant(struct mmc_host *host)
+{
+	int ret;
+
+	if (!(host->caps & MMC_CAP_UHSII) || !host->ops->exit_dormant)
+		return 0;
+
+	mmc_host_clk_hold(host);
+	ret = host->ops->exit_dormant(host);
+	mmc_host_clk_release(host);
+
+	return ret;
+}
+
 /*
  * Fetch CID from card.
  */
@@ -831,12 +863,12 @@ int mmc_sd_setup_card(struct mmc_host *host, struct mmc_card *card,
 		/* Erase init depends on CSD and SSR */
 		mmc_init_erase(card);
 
-		/*
-		 * Fetch switch information from card.
-		 */
-		err = mmc_read_switch(card);
-		if (err)
-			return err;
+		if (!mmc_card_uhsii(card)) {
+			/* Fetch switch information from card. */
+			err = mmc_read_switch(card);
+			if (err)
+				return err;
+		}
 	}
 
 	/*
@@ -890,14 +922,10 @@ unsigned mmc_sd_get_max_clock(struct mmc_card *card)
 
 /*
  * Handle the detection and initialisation of a card.
- *
- * In the case of a resume, "oldcard" will contain the card
- * we're trying to reinitialise.
  */
-static int mmc_sd_init_card(struct mmc_host *host, u32 ocr,
-	struct mmc_card *oldcard)
+static int mmc_sd_do_init_card(struct mmc_host *host, u32 ocr,
+		struct mmc_card *card, bool reinit)
 {
-	struct mmc_card *card;
 	int err;
 	u32 cid[4];
 	u32 rocr = 0;
@@ -909,19 +937,11 @@ static int mmc_sd_init_card(struct mmc_host *host, u32 ocr,
 	if (err)
 		return err;
 
-	if (oldcard) {
-		if (memcmp(cid, oldcard->raw_cid, sizeof(cid)) != 0)
+	if (reinit) {
+		if (memcmp(cid, card->raw_cid, sizeof(cid)) != 0)
 			return -ENOENT;
-
-		card = oldcard;
 	} else {
-		/*
-		 * Allocate card structure.
-		 */
-		card = mmc_alloc_card(host, &sd_type);
-		if (IS_ERR(card))
-			return PTR_ERR(card);
-
+		card->dev.type = &sd_type;
 		card->ocr = ocr;
 		card->type = MMC_TYPE_SD;
 		memcpy(card->raw_cid, cid, sizeof(card->raw_cid));
@@ -942,7 +962,7 @@ static int mmc_sd_init_card(struct mmc_host *host, u32 ocr,
 			goto free_card;
 	}
 
-	if (!oldcard) {
+	if (!reinit) {
 		err = mmc_sd_get_csd(host, card);
 		if (err)
 			goto free_card;
@@ -966,9 +986,12 @@ static int mmc_sd_init_card(struct mmc_host *host, u32 ocr,
 			goto free_card;
 	}
 
-	err = mmc_sd_setup_card(host, card, oldcard != NULL);
+	err = mmc_sd_setup_card(host, card, reinit);
 	if (err)
 		goto free_card;
+
+	if (mmc_card_uhsii(card))
+		return 0;
 
 	/* Initialization sequence for UHS-I cards */
 	if (rocr & SD_ROCR_S18A) {
@@ -995,7 +1018,8 @@ static int mmc_sd_init_card(struct mmc_host *host, u32 ocr,
 		 */
 		if ((host->caps & MMC_CAP_4_BIT_DATA) &&
 			(card->scr.bus_widths & SD_SCR_BUS_WIDTH_4)) {
-			err = mmc_app_set_bus_width(card, MMC_BUS_WIDTH_4);
+			err = mmc_app_set_bus_width(card,
+					MMC_BUS_WIDTH_4);
 			if (err)
 				goto free_card;
 
@@ -1003,14 +1027,21 @@ static int mmc_sd_init_card(struct mmc_host *host, u32 ocr,
 		}
 	}
 
-	host->card = card;
 	return 0;
-
-free_card:
-	if (!oldcard)
-		mmc_remove_card(card);
-
+free_card:				/* reserve to reduce diff hunk */
 	return err;
+}
+
+static inline int mmc_sd_reinit_card(struct mmc_host *host, u32 ocr,
+		struct mmc_card *card)
+{
+	return mmc_sd_do_init_card(host, ocr, card, true);
+}
+
+static inline int mmc_sd_init_card(struct mmc_host *host, u32 ocr,
+		struct mmc_card *card)
+{
+	return mmc_sd_do_init_card(host, ocr, card, false);
 }
 
 /*
@@ -1119,11 +1150,16 @@ static int _mmc_sd_resume(struct mmc_host *host)
 	if (!mmc_card_suspended(host->card))
 		goto out;
 
-	mmc_power_up(host, host->card->ocr);
-	err = mmc_sd_init_card(host, host->card->ocr, host->card);
-	mmc_card_clr_suspended(host->card);
+	if (mmc_card_uhsii(host->card))
+		mmc_sd_init_uhsii_card(host->card);
+
+	if (!mmc_card_uhsii(host->card))
+		mmc_power_up(host, host->card->ocr);
+
+	err = mmc_sd_reinit_card(host, host->card->ocr, host->card);
 
 out:
+	mmc_card_clr_suspended(host->card);
 	mmc_release_host(host);
 	return err;
 }
@@ -1186,7 +1222,7 @@ static int mmc_sd_power_restore(struct mmc_host *host)
 	int ret;
 
 	mmc_claim_host(host);
-	ret = mmc_sd_init_card(host, host->card->ocr, host->card);
+	ret = mmc_sd_reinit_card(host, host->card->ocr, host->card);
 	mmc_release_host(host);
 
 	return ret;
@@ -1211,6 +1247,161 @@ static const struct mmc_bus_ops mmc_sd_ops = {
 	.reset = mmc_sd_reset,
 };
 
+static inline void mmc_set_uhsii_ios(struct mmc_host *host)
+{
+	struct mmc_uhsii_ios *ios = &host->uhsii_ios;
+
+	pr_debug("%s: speedrange %d nfcu %d\n",
+		 mmc_hostname(host), ios->speed_range, ios->n_fcu);
+
+	host->ops->set_uhsii_ios(host, ios);
+}
+
+int mmc_sd_init_uhsii_card(struct mmc_card *card)
+{
+	struct mmc_host *host = card->host;
+	int err = 0, i;
+	u32 cap[2], setting;
+
+	mmc_card_set_uhsii(card);
+
+	err = mmc_sd_switch_uhsii_if(host);
+	if (err) {
+		mmc_card_clr_uhsii(card);
+		return err;
+	}
+
+	pr_debug("%s: try UHS-II interface\n", mmc_hostname(host));
+
+	for (i = 0; i < 5; i++) {
+		err = mmc_sd_send_device_init_ccmd(card);
+		if (!err)
+			break;
+
+		msleep(20);
+	}
+	if (err)
+		goto poweroff;
+
+	err = mmc_sd_send_enumerate_ccmd(card);
+	if (err)
+		goto poweroff;
+
+	err = mmc_sd_read_cfg_ccmd(card, SD40_IOADR_GEN_CAP_L, 2, cap);
+	if (err)
+		goto poweroff;
+	card->lane_mode = (cap[0] & SD40_LANE_MODE_MASK) >>
+		SD40_LANE_MODE_SHIFT;
+	card->lane_mode &= host->lane_mode;
+	pr_debug("%s: card->lane_mode = 0x%x\n",
+		mmc_hostname(host), card->lane_mode);
+
+	err = mmc_sd_read_cfg_ccmd(card, SD40_IOADR_PHY_CAP_L, 2, cap);
+	if (err)
+		goto poweroff;
+	card->n_lss_dir = (cap[1] & 0xF0) >> 4;
+	card->n_lss_syn = cap[1] & 0x0F;
+	pr_debug("%s: card->n_lss_dir = %d, card->n_lss_syn = %d\n",
+		mmc_hostname(host), card->n_lss_dir, card->n_lss_syn);
+
+	err = mmc_sd_read_cfg_ccmd(card, SD40_IOADR_LINK_CAP_L, 2, cap);
+	if (err)
+		goto poweroff;
+	card->n_fcu = (cap[0] & 0xFF00) >> 8;
+	card->max_retry_num = (cap[0] & 0x30000) >> 16;
+	card->max_blklen = (cap[0] & 0xFFF00000) >> 20;
+	card->n_data_gap = cap[1] & 0xFF;
+	pr_debug("%s: card->n_fcu = %d\n", mmc_hostname(host), card->n_fcu);
+	pr_debug("%s: card->max_retry_num = %d\n",
+		mmc_hostname(host), card->max_retry_num);
+	pr_debug("%s: card->max_blklen = %d\n",
+		mmc_hostname(host), card->max_blklen);
+	pr_debug("%s: card->n_data_gap = %d\n",
+		mmc_hostname(host), card->n_data_gap);
+
+	if (card->n_lss_dir < host->n_lss_dir)
+		card->n_lss_dir = host->n_lss_dir;
+	if (card->n_lss_syn < host->n_lss_syn)
+		card->n_lss_syn = host->n_lss_syn;
+	setting = ((card->n_lss_dir << 4) & 0xF0) | (card->n_lss_syn & 0x0F);
+	err = mmc_sd_write_cfg_ccmd(card,
+			SD40_IOADR_PHY_SET_H, 1, &setting);
+	if (err)
+		goto poweroff;
+
+	if (card->n_data_gap < host->n_data_gap)
+		card->n_data_gap = host->n_data_gap;
+	setting = card->n_data_gap;
+	err = mmc_sd_write_cfg_ccmd(card,
+			SD40_IOADR_LINK_SET_H, 1, &setting);
+	if (err)
+		goto poweroff;
+
+	if (host->caps2 & MMC_CAP2_UHSII_LOW_PWR) {
+		/* Set low power mode */
+		setting = SD40_LOW_PWR_MODE;
+		err = mmc_sd_write_cfg_ccmd(card,
+				SD40_IOADR_GEN_SET_L, 1, &setting);
+		if (err)
+			goto poweroff;
+		host->uhsii_ios.pwr_ctl_mode = SD_UHSII_PWR_CTL_LOW_PWR_MODE;
+		host->uhsii_ios.flags = SETTING_PWR_CTL_MODE;
+		mmc_set_uhsii_ios(host);
+	}
+
+	if (host->n_fcu) {
+		if (!card->n_fcu || (card->n_fcu > host->n_fcu))
+			card->n_fcu = host->n_fcu;
+	}
+	setting = (card->n_fcu << 8) | (card->max_retry_num << 16) |
+		(card->max_blklen << 20);
+	err = mmc_sd_write_cfg_ccmd(card, SD40_IOADR_LINK_SET_L, 1, &setting);
+	if (err)
+		goto poweroff;
+
+	setting = SD40_CONFIG_COMPLETE;
+	err = mmc_sd_write_cfg_ccmd(card, SD40_IOADR_GEN_SET_H, 1, &setting);
+	if (err)
+		goto poweroff;
+
+	host->uhsii_ios.n_fcu = card->n_fcu;
+	host->uhsii_ios.flags = SETTING_N_FCU;
+	mmc_set_uhsii_ios(host);
+
+	if (host->caps2 & MMC_CAP2_UHSII_RANGE_AB) {
+		pr_debug("%s: Select Speed Range B\n", mmc_hostname(host));
+
+		setting = (1 << 6);
+		err = mmc_sd_write_cfg_ccmd(card,
+				SD40_IOADR_PHY_SET_L, 1, &setting);
+		if (err)
+			goto poweroff;
+
+		host->uhsii_ios.speed_range = SD_UHSII_SPEED_RANGE_B;
+		host->uhsii_ios.flags = SETTING_SPEED_RANGE;
+		mmc_set_uhsii_ios(host);
+
+		/* Enter dormant state */
+		err = mmc_sd_send_go_dormant_state_ccmd(card, 0);
+		if (err)
+			goto poweroff;
+
+		/* Exit dormant state */
+		err = mmc_sd_exit_dormant(host);
+		if (err)
+			goto poweroff;
+	}
+
+	pr_debug("%s: UHSII-interface init success\n", mmc_hostname(host));
+	return 0;
+
+poweroff:
+	mmc_power_off(host);
+	mmc_card_clr_uhsii(card);
+
+	return err;
+}
+
 /*
  * Starting point for SD card init.
  */
@@ -1218,13 +1409,22 @@ int mmc_attach_sd(struct mmc_host *host)
 {
 	int err;
 	u32 ocr, rocr;
+	struct mmc_card *card;
 
-	BUG_ON(!host);
+	BUG_ON(!host && !host->card);
 	WARN_ON(!host->claimed);
 
+	card = host->card;
+
+	/*
+	 * some sd4.0 card may fail to response ACMD41 with arg=0.
+	 */
 	err = mmc_send_app_op_cond(host, 0, &ocr);
-	if (err)
-		return err;
+	if (err) {
+		ocr = MMC_VDD_32_33 | MMC_VDD_33_34;
+		pr_debug("%s: using default ocr = 0x%08x\n",
+			mmc_hostname(host), ocr);
+	}
 
 	mmc_attach_bus(host, &mmc_sd_ops);
 	if (host->ocr_avail_sd)
@@ -1254,23 +1454,18 @@ int mmc_attach_sd(struct mmc_host *host)
 	/*
 	 * Detect and init the card.
 	 */
-	err = mmc_sd_init_card(host, rocr, NULL);
+	err = mmc_sd_init_card(host, rocr, card);
 	if (err)
 		goto err;
 
 	mmc_release_host(host);
-	err = mmc_add_card(host->card);
+	err = mmc_add_card(card);
 	mmc_claim_host(host);
 	if (err)
-		goto remove_card;
+		goto err;
 
 	return 0;
 
-remove_card:
-	mmc_release_host(host);
-	mmc_remove_card(host->card);
-	host->card = NULL;
-	mmc_claim_host(host);
 err:
 	mmc_detach_bus(host);
 

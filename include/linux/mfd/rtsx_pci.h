@@ -147,6 +147,169 @@
 #define RTSX_PHASE_MAX			32
 #define RX_TUNING_CNT			3
 
+#define SD40_TX_HDR0			0xEC00
+#define SD40_TX_HDR1			0xEC01
+#define SD40_TX_ARG0			0xEC02
+#define SD40_TX_ARG1			0xEC03
+#define SD40_TX_ARG2			0xEC04
+#define SD40_TX_ARG3			0xEC05
+#define SD40_TX_ARG4			0xEC06
+#define SD40_TX_PLD_DW0			0xEC07
+#define SD40_TX_PLD_DW1			0xEC0B
+#define SD40_TX_PLD_DW2			0xEC0F
+#define SD40_TX_PLD_DW3			0xEC13
+#define SD40_RX_HDR			0xEC17
+#define SD40_RX_ARG			0xEC19
+#define   RES_NAK			0x80
+#define SD40_RX_PLD_DW0			0xEC1B
+#define SD40_RX_PLD_DW1			0xEC1F
+#define SD40_RX_PLD_DW2			0xEC23
+#define SD40_RX_PLD_DW3			0xEC27
+
+#define SD40_TRAN			0xEC2B
+#define   SD40_TRANS_START		0x80
+#define   SD40_TRANS_END		0x40
+#define   SD40_TRANS_ERR		0x10
+
+#define SD40_CTRL			0xEC2C
+#define   SD40_MAC_RST			0x80
+#define   SD40_PHY_RST			0x40
+#define   SD40_PHY_ISO			0x20
+#define   SD40_DLSM_RST			0x10
+#define   SD40_TSSM_RST			0x08
+#define   SD40_GO_HIBERNATE		0x04
+#define   SD40_GO_DORMANT		0x02
+#define   SD40_EXIT_DORMANT		0x01
+
+#define SD40_STATUS0			0xEC2D
+
+#define SD40_STATUS1			0xEC2E
+#define   SD40_HEAD_ERR			0x40
+#define   SD40_FRAM_ERR			0x20
+#define   SD40_CRC_ERR			0x10
+#define   TSSM_STATE_MASK		0x0F
+
+#define SD40_STATUS2			0xEC2F
+
+#define SD40_STATUS3			0xEC30
+#define   DLSM_STATE_MASK		0xF8
+#define   SD40_CLK_RDY			0x04
+#define   SD40_DET			0x02
+#define   SD40_NORMAL_MODE		0x01
+
+#define SD40_STATUS4			0xEC31
+#define SD40_DUMMY0			0xEC32
+#define SD40_DUMMY1			0xEC33
+
+#define SD40_MISC			0xEC34
+#define   SD40_TMOUT_ERR_CLR		0x80
+#define   SD40_RETRY_EN			0x20
+#define   SD40_RETRY_DIS		0x00
+#define   SD40_CMD_RSP			0x10
+#define   SD40_CMD_NO_RSP		0x00
+#define   DPHY_LINK_WIDTH_16B		0x08
+#define   DPHY_LINK_WIDTH_8B		0x00
+#define   SCRAM_DIS_EN			0x04
+#define   SCRAM_EN			0x00
+#define   TX_EDGE_NEG			0x02
+#define   TX_EDGE_POS			0x00
+#define   RX_EDGE_NEG			0x01
+#define   RX_EDGE_POS			0x00
+
+#define SD40_TMOUT_0			0xEC48
+#define   SD40_T_EIDLE_STB_OUT		0x80
+#define   SD40_T_ACTIVE_INIT_OUT	0x40
+#define   SD40_T_LIDLE_LIDLE_OUT	0x20
+#define   SD40_T_LIDLE_FCREQ_BOOT_OUT	0x10
+#define   SD40_T_DINI_CMD_OUT		0x08
+#define   SD40_T_CMD_RSP_OUT		0x04
+#define   SD40_T_FWD_BCMD_OUT		0x02
+#define   SD40_T_RES_FCREQ_OUT		0x01
+
+#define SD40_TMOUT_1			0xEC49
+#define   SD40_TIME_OUT_ERR_EN		0x80
+#define   SD40_T_STAT_FCREQ_OUT		0x08
+#define   SD40_T_FCREQ_RDY_OUT		0x04
+#define   SD40_T_FCRDY_EDB_OUT		0x02
+#define   SD40_T_EDB_STAT_OUT		0x01
+
+#define SD40_TRAN_LEN_0			0xEC4C
+#define SD40_TRAN_LEN_1			0xEC4D
+#define SD40_TRAN_LEN_2			0xEC4E
+#define SD40_TRAN_LEN_3			0xEC4F
+
+#define SD40_EBSY			0xEC4B
+#define   SD40_HAS_EBSY                 0x80
+#define   SD40_NO_EBSY                  0x00
+#define   SD40_WAIT_EBSY                0x40
+#define   SD40_NO_WAIT_EBSY             0x00
+#define   SD40_EBSY_READ_RES_TMOUT	0x0
+#define   SD40_EBSY_WRITE_RES_TMOUT	0x1
+#define   SD40_STAT_EBSY_TMOUT          0x2
+
+#define SD40_TRAN_LEN_0			0xEC4C
+#define SD40_TRAN_LEN_1			0xEC4D
+#define SD40_TRAN_LEN_2			0xEC4E
+#define SD40_TRAN_LEN_3			0xEC4F
+
+#define SD40_ERR_ST			0xEC51
+#define   SD40_LINK_MEM_ERR		0x80
+#define   SD40_LINK_UNRECV_ERR		0x40
+#define   SD40_LINK_RECV_ERR		0x20
+#define   SD40_RETRY_EXP_R_ERR		0x10
+#define   SD40_PACKET_ERR		0x08
+#define   SD40_RETRY_EXP_W_ERR		0x04
+#define   SD40_HEADER_ERR		0x02
+#define   SD40_NACK_ERR			0x01
+
+#define SD40_MISC			0xEC34
+#define SD40_TBASE_L			0xEC35
+#define SD40_TBASE_H			0xEC36
+#define TMO_DIDLE_STB			0xEC37
+#define TMO_ACTV_INIT_L			0xEC38
+#define TMO_ACTV_INIT_H			0xEC39
+#define TMO_ACTV_NRML			0xEC3A
+#define TMO_DINI_CMD_L			0xEC3B
+#define TMO_DINI_CMD_H			0xEC3C
+#define TMO_CMD_RES			0xEC3D
+#define TMO_RES_FCREQ_L			0xEC3E
+#define TMO_RES_FCREQ_H			0xEC3F
+#define TMO_FCREQ_FCRDY_L		0xEC40
+#define TMO_FCREQ_FCRDY_H		0xEC41
+#define TMO_FCRDY_EDB_L			0xEC42
+#define TMO_FCRDY_EDB_H			0xEC43
+#define EIDL_IN_OUT_CNT			0xEC44
+#define DIR_SW_CLK_CNT			0xEC45
+#define RD_SYN_CLK_CNT			0xEC46
+#define PCMD_DELAY_CNT			0xEC47
+#define SD40_TIMEOUT_0			0xEC48
+#define   SD40_T_EIDLE_STB_OUT		0x80
+#define   SD40_T_ACTIVE_INIT_OUT	0x40
+#define   SD40_T_LIDLE_LIDLE_OUT	0x20
+#define   SD40_T_LIDLE_FCREQ_BOOT_OUT	0x10
+#define   SD40_T_DINI_CMD_OUT		0x08
+#define   SD40_T_CMD_RSP_OUT		0x04
+#define   SD40_T_FWD_BCMD_OUT		0x02
+#define   SD40_T_RES_FCREQ_OUT		0x01
+#define SD40_TIMEOUT_1			0xEC49
+#define SD40_ENTLPBK			0xEC4A
+#define SD40_ERR_EN			0xEC50
+
+#define SD40_GEN_CAP			0xE000 /* 0:7 */
+#define SD40_GEN_SET			0xE020 /* 0:7 */
+#define   SD40_LOW_POWER_MODE		0x01
+
+#define SD40_PHY_CAP			0xE008 /* 0:7 */
+#define SD40_PHY_SET			0xE028 /* 0:7 */
+#define   SD40_SPEED_RANGE_MASK		0xC0
+#define   SD40_SPEED_RANGE_SHIFT	6
+
+#define SD40_LINK_CAP			0xE010 /* 0:7 */
+#define SD40_LINK_SET			0xE030 /* 0:7 */
+
+#define STATUS_BASE			0xE600
+#define   RETRY_EXPIRE			0x04
+
 #define MS_CFG				0xFD40
 #define   SAMPLE_TIME_RISING		0x00
 #define   SAMPLE_TIME_FALLING		0x80
@@ -227,6 +390,7 @@
 #define   SD_RSP_TYPE_R7		0x01
 #define SD_CFG3				0xFDA2
 #define   SD_RSP_80CLK_TIMEOUT_EN	0x01
+#define   SD30_CLK_END_EN		0x10
 
 #define SD_STAT1			0xFDA3
 #define   SD_CRC7_ERR			0x80
@@ -309,7 +473,10 @@
 
 #define SD_DATA_STATE			0xFDB6
 #define   SD_DATA_IDLE			0x80
-
+#define SD_STOP_CLK_CFG			0xFDB8
+#define   SD30_CLK_STOP_CFG_EN		0x04
+#define   SD30_CLK_STOP_CFG1		0x02
+#define   SD30_CLK_STOP_CFG0		0x01
 #define SRCTL				0xFC13
 
 #define DCM_DRP_CTL			0xFC23
@@ -376,6 +543,12 @@
 #define   BPP_POWER_MASK		0x0F
 #define   SD_VCC_PARTIAL_POWER_ON	0x02
 #define   SD_VCC_POWER_ON		0x00
+#define   SD40_PAD_ISO			0x80
+#define   SD_VIO_PWR_MASK		0x0C
+#define   SD_VIO_PWR_OFF		0x0C
+#define   SD_VIO_PWR14_ON		0x08
+#define   SD_VIO_PWR_ON			0x00
+
 #define CARD_CLK_SWITCH			0xFD51
 #define RTL8411B_PACKAGE_MODE		0xFD51
 #define CARD_SHARE_MODE			0xFD52
@@ -423,6 +596,9 @@
 #define CARD_SELECT			0xFD5C
 #define   SD_MOD_SEL			2
 #define   MS_MOD_SEL			3
+#define   SD40_MOD_SEL			0x05
+#define   CARD_MOD_MASK			0x07
+
 #define SD30_DRIVE_SEL			0xFD5E
 #define   CFG_DRIVER_TYPE_A		0x02
 #define   CFG_DRIVER_TYPE_B		0x03
@@ -433,6 +609,8 @@
 #define CARD_CLK_EN			0xFD69
 #define   SD_CLK_EN			0x04
 #define   MS_CLK_EN			0x08
+#define   SD40_CLK_EN			0x10
+
 #define SDIO_CTRL			0xFD6B
 #define CD_PAD_CTL			0xFD73
 #define   CD_DISABLE_MASK		0x07
@@ -459,6 +637,7 @@
 #define CLK_CTL				0xFC02
 #define   CHANGE_CLK			0x01
 #define   CLK_LOW_FREQ			0x01
+#define   CHANGE_SD40_PCLK		0x02
 
 #define CLK_DIV				0xFC03
 #define   CLK_DIV_1			0x01
@@ -546,7 +725,12 @@
 #define   DMA_256			(1 << 4)
 #define   DMA_512			(2 << 4)
 #define   DMA_1024			(3 << 4)
-#define   DMA_PACK_SIZE_MASK		0x30
+#define   DMA_2048			(4 << 4)
+#define   DMA_4096			(5 << 4)
+#define   DMA_8192			(6 << 4)
+#define   DMA_16384			(7 << 4)
+#define   DMA_32768			(0 << 4)
+#define   DMA_PACK_SIZE_MASK		0x70
 #define BCTL				0xFE2D
 #define RBBC0				0xFE2E
 #define RBBC1				0xFE2F
@@ -611,6 +795,13 @@
 #define   LDO_OFF			0x06
 #define PWD_SUSPEND_EN			0xFE76
 #define LDO_PWR_SEL			0xFE78
+#define SD40_LDO_CTL			0xFE7C
+#define   SD40_VCC_TUNE_MASK		0xE0
+#define   SD40_LDO12_MASK		0x1C
+#define   SD40_LDO12AS_MASK		0x03
+#define   SD40_LD012AS_OFF		0x00
+#define   SD40_LD012AS_ON_ALL		0x03
+#define   SD40_LD012AS_ON_PL		0x01
 
 #define L1SUB_CONFIG1			0xFE8D
 #define L1SUB_CONFIG2			0xFE8E
@@ -873,6 +1064,10 @@ struct pcr_ops {
 	int		(*conv_clk_and_div_n)(int clk, int dir);
 	void		(*fetch_vendor_settings)(struct rtsx_pcr *pcr);
 	void		(*force_power_down)(struct rtsx_pcr *pcr, u8 pm_state);
+	int (*init_sd40_hw)(struct rtsx_pcr *pcr, u8 stage);
+#define RTSX_DORMANT_ENTER			0
+#define RTSX_DORMANT_EXIT			1
+	int (*set_dormant_state) (struct rtsx_pcr *pcr, u8 state);
 };
 
 enum PDEV_STAT  {PDEV_STAT_IDLE, PDEV_STAT_RUN};
@@ -917,6 +1112,7 @@ struct rtsx_pcr {
 	unsigned int			cur_clock;
 	bool				remove_pci;
 	bool				msi_en;
+	bool				use_vdd2;
 
 #define EXTRA_CAPS_SD_SDR50		(1 << 0)
 #define EXTRA_CAPS_SD_SDR104		(1 << 1)
@@ -924,6 +1120,8 @@ struct rtsx_pcr {
 #define EXTRA_CAPS_MMC_HSDDR		(1 << 3)
 #define EXTRA_CAPS_MMC_HS200		(1 << 4)
 #define EXTRA_CAPS_MMC_8BIT		(1 << 5)
+#define EXTRA_CAPS_SD_UHSII		(1 << 6)
+#define EXTRA_CAPS_SD_UHSII_RANGE_B	(1 << 7)
 	u32				extra_caps;
 
 #define IC_VER_A			0
@@ -947,6 +1145,8 @@ struct rtsx_pcr {
 
 	const u32			*sd_pull_ctl_enable_tbl;
 	const u32			*sd_pull_ctl_disable_tbl;
+	const u32			*sd40_pull_ctl_enable_tbl;
+	const u32			*sd40_pull_ctl_disable_tbl;
 	const u32			*ms_pull_ctl_enable_tbl;
 	const u32			*ms_pull_ctl_disable_tbl;
 
@@ -1005,8 +1205,10 @@ int rtsx_pci_switch_clock(struct rtsx_pcr *pcr, unsigned int card_clock,
 		u8 ssc_depth, bool initial_mode, bool double_clk, bool vpclk);
 int rtsx_pci_card_power_on(struct rtsx_pcr *pcr, int card);
 int rtsx_pci_card_power_off(struct rtsx_pcr *pcr, int card);
+int rtsx_pci_init_sd40_hw(struct rtsx_pcr *pcr, u8 stage);
 int rtsx_pci_card_exclusive_check(struct rtsx_pcr *pcr, int card);
 int rtsx_pci_switch_output_voltage(struct rtsx_pcr *pcr, u8 voltage);
+int rtsx_pci_set_dormant_state(struct rtsx_pcr *pcr, u8 state);
 unsigned int rtsx_pci_card_exist(struct rtsx_pcr *pcr);
 void rtsx_pci_complete_unfinished_transfer(struct rtsx_pcr *pcr);
 

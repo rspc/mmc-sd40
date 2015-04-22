@@ -45,6 +45,7 @@
 #include "mmc_ops.h"
 #include "sd_ops.h"
 #include "sdio_ops.h"
+#include "sd.h"
 
 /* If the device is not responding */
 #define MMC_CORE_TIMEOUT_MS	(10 * 60 * 1000) /* 10 minute timeout */
@@ -131,7 +132,42 @@ static inline void mmc_should_fail_request(struct mmc_host *host,
 void mmc_request_done(struct mmc_host *host, struct mmc_request *mrq)
 {
 	struct mmc_command *cmd = mrq->cmd;
-	int err = cmd->error;
+	struct mmc_tlp *tlp = mrq->tlp;
+	int err;
+
+	if (tlp && cmd)
+		pr_debug("%s: cmd and native tlp conflict, done native tlp\n",
+			mmc_hostname(host));
+
+	if (tlp) {
+		err = tlp->error;
+		if (err && tlp->retries && !mmc_card_removed(host->card)) {
+			/*
+			 * Request starter must handle retries - see
+			 * mmc_wait_for_req_done().
+			 */
+			if (mrq->done)
+				mrq->done(mrq);
+		} else {
+			led_trigger_event(host->led, LED_OFF);
+
+			pr_debug("%s: native TLP req done(%d) %04x %04x %08x %08x %08x %08x\n",
+				mmc_hostname(host), err,
+				tlp->tlp_back->header, tlp->tlp_back->argument,
+				tlp->tlp_back->payload[0],
+				tlp->tlp_back->payload[1],
+				tlp->tlp_back->payload[2],
+				tlp->tlp_back->payload[3]);
+
+			if (mrq->done)
+				mrq->done(mrq);
+
+			mmc_host_clk_release(host);
+		}
+		return;
+	}
+
+	err = cmd->error;
 
 	if (err && cmd->retries && mmc_host_is_spi(host)) {
 		if (cmd->resp[0] & R1_SPI_ILLEGAL_COMMAND)
@@ -201,9 +237,18 @@ static int mmc_start_request(struct mmc_host *host, struct mmc_request *mrq)
 			 mrq->sbc->arg, mrq->sbc->flags);
 	}
 
-	pr_debug("%s: starting CMD%u arg %08x flags %08x\n",
-		 mmc_hostname(host), mrq->cmd->opcode,
-		 mrq->cmd->arg, mrq->cmd->flags);
+	if (mrq->tlp && mrq->cmd)
+		pr_debug("%s: cmd and native tlp conflict, start native tlp\n",
+			mmc_hostname(host));
+
+	if (mrq->tlp)
+		pr_debug("%s: starting native TLP header %04x argument %04x\n",
+			 mmc_hostname(host), mrq->tlp->tlp_send->header,
+			 mrq->tlp->tlp_send->argument);
+	else if (mrq->cmd)
+		pr_debug("%s: starting CMD%u arg %08x flags %08x\n",
+			 mmc_hostname(host), mrq->cmd->opcode,
+			 mrq->cmd->arg, mrq->cmd->flags);
 
 	if (mrq->data) {
 		pr_debug("%s:     blksz %d blocks %d flags %08x "
@@ -221,6 +266,8 @@ static int mmc_start_request(struct mmc_host *host, struct mmc_request *mrq)
 	}
 
 	WARN_ON(!host->claimed);
+	if (!mrq->cmd)
+		goto start;
 
 	mrq->cmd->error = 0;
 	mrq->cmd->mrq = mrq;
@@ -250,6 +297,25 @@ static int mmc_start_request(struct mmc_host *host, struct mmc_request *mrq)
 			mrq->stop->mrq = mrq;
 		}
 	}
+
+	if (mmc_card_uhsii(host->card)) {
+		mrq->cmd->use_tlp = true;
+		if (mrq->data)
+			mmc_sd_tran_pack_dcmd(host->card, mrq->cmd);
+		else
+			mmc_sd_tran_pack_ccmd(host->card, mrq->cmd);
+
+		if (mrq->sbc) {
+			mrq->sbc->use_tlp = true;
+			mmc_sd_tran_pack_ccmd(host->card, mrq->sbc);
+		}
+		if (mrq->stop) {
+			mrq->stop->use_tlp = true;
+			mmc_sd_tran_pack_ccmd(host->card, mrq->stop);
+		}
+	}
+
+start:
 	mmc_host_clk_hold(host);
 	led_trigger_event(host->led, LED_FULL);
 	host->ops->request(host, mrq);
@@ -356,7 +422,7 @@ static int __mmc_start_data_req(struct mmc_host *host, struct mmc_request *mrq)
 
 	err = mmc_start_request(host, mrq);
 	if (err) {
-		mrq->cmd->error = err;
+		mmc_set_mrq_error_code(mrq, err);
 		mmc_wait_data_done(mrq);
 	}
 
@@ -372,7 +438,7 @@ static int __mmc_start_req(struct mmc_host *host, struct mmc_request *mrq)
 
 	err = mmc_start_request(host, mrq);
 	if (err) {
-		mrq->cmd->error = err;
+		mmc_set_mrq_error_code(mrq, err);
 		complete(&mrq->completion);
 	}
 
@@ -436,7 +502,7 @@ static int mmc_wait_for_data_req_done(struct mmc_host *host,
 	return err;
 }
 
-static void mmc_wait_for_req_done(struct mmc_host *host,
+static void mmc_wait_for_cmd_req_done(struct mmc_host *host,
 				  struct mmc_request *mrq)
 {
 	struct mmc_command *cmd;
@@ -473,6 +539,35 @@ static void mmc_wait_for_req_done(struct mmc_host *host,
 		cmd->error = 0;
 		host->ops->request(host, mrq);
 	}
+}
+
+static void mmc_wait_for_tlp_req_done(struct mmc_host *host,
+				  struct mmc_request *mrq)
+{
+	struct mmc_tlp *tlp;
+
+	while (1) {
+		wait_for_completion(&mrq->completion);
+
+		tlp = mrq->tlp;
+
+		if (!tlp->error || !tlp->retries || mmc_card_removed(host->card))
+			break;
+
+		pr_debug("%s: native TLP req failed: %d, retrying...\n",
+			mmc_hostname(host), tlp->error);
+		tlp->retries--;
+		tlp->error = 0;
+		host->ops->request(host, mrq);
+	}
+}
+
+static void mmc_wait_for_req_done(struct mmc_host *host, struct mmc_request *mrq)
+{
+	if (mrq->cmd)
+		mmc_wait_for_cmd_req_done(host, mrq);
+	else
+		mmc_wait_for_tlp_req_done(host, mrq);
 }
 
 /**
@@ -1453,7 +1548,8 @@ u32 mmc_select_voltage(struct mmc_host *host, u32 ocr)
 		return 0;
 	}
 
-	if (host->caps2 & MMC_CAP2_FULL_PWR_CYCLE) {
+	if (!mmc_card_uhsii(host->card) &&
+		(host->caps2 & MMC_CAP2_FULL_PWR_CYCLE)) {
 		bit = ffs(ocr) - 1;
 		ocr &= 3 << bit;
 		mmc_power_cycle(host, ocr);
@@ -2337,16 +2433,8 @@ int mmc_hw_reset(struct mmc_host *host)
 }
 EXPORT_SYMBOL(mmc_hw_reset);
 
-static int mmc_rescan_try_freq(struct mmc_host *host, unsigned freq)
+static int mmc_reset_card(struct mmc_host *host)
 {
-	host->f_init = freq;
-
-#ifdef CONFIG_MMC_DEBUG
-	pr_info("%s: %s: trying to init card at %u Hz\n",
-		mmc_hostname(host), __func__, host->f_init);
-#endif
-	mmc_power_up(host, host->ocr_avail);
-
 	/*
 	 * Some eMMCs (with VCCQ always on) may not be reset after power up, so
 	 * do a hardware reset if possible.
@@ -2373,6 +2461,20 @@ static int mmc_rescan_try_freq(struct mmc_host *host, unsigned freq)
 
 	mmc_power_off(host);
 	return -EIO;
+}
+
+static int mmc_rescan_try_freq(struct mmc_host *host, unsigned freq)
+{
+	host->f_init = freq;
+
+#ifdef CONFIG_MMC_DEBUG
+	pr_info("%s: %s: trying to init card at %u Hz\n",
+		mmc_hostname(host), __func__, host->f_init);
+#endif
+
+	mmc_power_up(host, host->ocr_avail);
+
+	return mmc_reset_card(host);
 }
 
 int _mmc_detect_card_removed(struct mmc_host *host)
@@ -2446,7 +2548,8 @@ void mmc_rescan(struct work_struct *work)
 {
 	struct mmc_host *host =
 		container_of(work, struct mmc_host, detect.work);
-	int i;
+	struct mmc_card *card;
+	int i, err;
 
 	if (host->trigger_card_event && host->ops->card_event) {
 		host->ops->card_event(host);
@@ -2501,13 +2604,36 @@ void mmc_rescan(struct work_struct *work)
 	}
 
 	mmc_claim_host(host);
-	for (i = 0; i < ARRAY_SIZE(freqs); i++) {
-		if (!mmc_rescan_try_freq(host, max(freqs[i], host->f_min)))
-			break;
-		if (freqs[i] <= host->f_min)
-			break;
+
+	card = mmc_alloc_card(host, NULL);
+	if (IS_ERR(card)) {
+		mmc_release_host(host);
+		goto out;
 	}
+	host->card = card;
+
+	mmc_sd_init_uhsii_card(card);
+
+	if (mmc_card_uhsii(card)) {
+		err = mmc_reset_card(host);
+	} else {
+		for (i = 0; i < ARRAY_SIZE(freqs); i++) {
+			err = mmc_rescan_try_freq(host,
+					max(freqs[i], host->f_min));
+			if (!err)
+				break;
+			if (freqs[i] <= host->f_min)
+				break;
+		}
+	}
+
 	mmc_release_host(host);
+
+	/* Attach fail, free host->card */
+	if (err) {
+		mmc_remove_card(host->card);
+		host->card = NULL;
+	}
 
  out:
 	if (host->caps & MMC_CAP_NEEDS_POLL)

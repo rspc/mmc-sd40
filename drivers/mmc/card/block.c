@@ -532,7 +532,7 @@ static int mmc_blk_ioctl_cmd(struct block_device *bdev,
 		goto cmd_rel_host;
 
 	if (idata->ic.is_acmd) {
-		err = mmc_app_cmd(card->host, card);
+		err = mmc_app_cmd(card->host, card, &cmd);
 		if (err)
 			goto cmd_rel_host;
 	}

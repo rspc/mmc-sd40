@@ -22,13 +22,19 @@
 #include "core.h"
 #include "sd_ops.h"
 
-int mmc_app_cmd(struct mmc_host *host, struct mmc_card *card)
+int mmc_app_cmd(struct mmc_host *host, struct mmc_card *card,
+	struct mmc_command *next_cmd)
 {
 	int err;
 	struct mmc_command cmd = {0};
 
 	BUG_ON(!host);
 	BUG_ON(card && (card->host != host));
+
+	if (card && mmc_card_uhsii(card)) {
+		next_cmd->app_cmd = true;
+		return 0;
+	}
 
 	cmd.opcode = MMC_APP_CMD;
 
@@ -82,7 +88,7 @@ int mmc_wait_for_app_cmd(struct mmc_host *host, struct mmc_card *card,
 	 * we cannot use the retries field in mmc_command.
 	 */
 	for (i = 0;i <= retries;i++) {
-		err = mmc_app_cmd(host, card);
+		err = mmc_app_cmd(host, card, cmd);
 		if (err) {
 			/* no point in retrying; no APP commands allowed */
 			if (mmc_host_is_spi(host)) {
@@ -162,7 +168,8 @@ int mmc_send_app_op_cond(struct mmc_host *host, u32 ocr, u32 *rocr)
 	cmd.flags = MMC_RSP_SPI_R1 | MMC_RSP_R3 | MMC_CMD_BCR;
 
 	for (i = 100; i; i--) {
-		err = mmc_wait_for_app_cmd(host, NULL, &cmd, MMC_CMD_RETRIES);
+		err = mmc_wait_for_app_cmd(host, host->card,
+			&cmd, MMC_CMD_RETRIES);
 		if (err)
 			break;
 
@@ -260,7 +267,7 @@ int mmc_app_send_scr(struct mmc_card *card, u32 *scr)
 
 	/* NOTE: caller guarantees scr is heap-allocated */
 
-	err = mmc_app_cmd(card->host, card);
+	err = mmc_app_cmd(card->host, card, &cmd);
 	if (err)
 		return err;
 
@@ -363,7 +370,7 @@ int mmc_app_sd_status(struct mmc_card *card, void *ssr)
 
 	/* NOTE: caller guarantees ssr is heap-allocated */
 
-	err = mmc_app_cmd(card->host, card);
+	err = mmc_app_cmd(card->host, card, &cmd);
 	if (err)
 		return err;
 
@@ -392,4 +399,214 @@ int mmc_app_sd_status(struct mmc_card *card, void *ssr)
 		return data.error;
 
 	return 0;
+}
+
+int mmc_sd_send_device_init_ccmd(struct mmc_card *card)
+{
+	struct mmc_host *host = card->host;
+	struct mmc_request mrq = {NULL};
+	struct mmc_tlp tlp = {NULL};
+	struct mmc_tlp_block cmd = {0}, resp = {0};
+	int i;
+	u8 gd = 0, gap;
+	u16 ioadr = UHSII_IOADR(SD40_IOADR_CMD_BASE, SD40_DEVICE_INIT);
+	u32 payload;
+
+	payload = SD40_CF | SD40_GAP(host->max_gap) | SD40_DAP(host->max_dap);
+
+	mrq.tlp = &tlp;
+	tlp.tlp_send = &cmd;
+	tlp.tlp_back = &resp;
+	tlp.retries = 0;
+
+	tlp.tlp_send->header = UHSII_HD_NP | UHSII_HD_TYP_CCMD;
+	tlp.tlp_send->argument = UHSII_ARG_DIR_WRITE |
+		(1 << UHSII_ARG_PLEN_SHIFT) | (ioadr & UHSII_ARG_IOADR_MASK);
+
+	for (i = 0; i < 30; i++) {
+		tlp.tlp_send->payload[0] = payload;
+
+		mmc_wait_for_req(host, &mrq);
+
+		if (tlp.error)
+			return tlp.error;
+
+		if (tlp.tlp_back->payload[0] & SD40_CF)
+			return 0;
+
+		gap = UHSII_GET_GAP(tlp.tlp_back);
+		if (gap == host->max_gap) {
+			gd++;
+			payload |= (gd & SD40_GD_MASK) << SD40_GD_SHIFT;
+		}
+	}
+
+	return -ETIMEDOUT;
+}
+
+int mmc_sd_send_enumerate_ccmd(struct mmc_card *card)
+{
+	struct mmc_host *host = card->host;
+	struct mmc_request mrq = {NULL};
+	struct mmc_tlp tlp = {NULL};
+	struct mmc_tlp_block cmd = {0}, resp = {0};
+	u16 ioadr = UHSII_IOADR(SD40_IOADR_CMD_BASE, SD40_ENUMERATE);
+
+	mrq.tlp = &tlp;
+	tlp.tlp_send = &cmd;
+	tlp.tlp_back = &resp;
+	tlp.retries = 0;
+
+	tlp.tlp_send->header = UHSII_HD_NP | UHSII_HD_TYP_CCMD;
+	tlp.tlp_send->argument = UHSII_ARG_DIR_WRITE |
+		(1 << UHSII_ARG_PLEN_SHIFT) | (ioadr & UHSII_ARG_IOADR_MASK);
+	tlp.tlp_send->payload[0] = 0;
+
+	mmc_wait_for_req(host, &mrq);
+
+	if (tlp.error)
+		return tlp.error;
+
+	card->node_id = (tlp.tlp_back->payload[0] & SD40_IDL_MASK)
+		>> SD40_IDL_SHIFT;
+
+	return 0;
+}
+
+int mmc_sd_send_go_dormant_state_ccmd(struct mmc_card *card, int hibernate)
+{
+	struct mmc_host *host = card->host;
+	struct mmc_request mrq = {NULL};
+	struct mmc_tlp tlp = {NULL};
+	struct mmc_tlp_block cmd = {0}, resp = {0};
+	u16 ioadr = UHSII_IOADR(SD40_IOADR_CMD_BASE, SD40_GO_DORMANT_STATE);
+
+	mrq.tlp = &tlp;
+	tlp.tlp_send = &cmd;
+	tlp.tlp_back = &resp;
+	tlp.retries = 0;
+	tlp.cmd_type = UHSII_COMMAND_GO_DORMANT;
+
+	tlp.tlp_send->header = UHSII_HD_NP | UHSII_HD_TYP_CCMD |
+		UHSII_HD_DID(card->node_id);
+	tlp.tlp_send->argument = UHSII_ARG_DIR_WRITE |
+		(1 << UHSII_ARG_PLEN_SHIFT) | (ioadr & UHSII_ARG_IOADR_MASK);
+	if (hibernate)
+		tlp.tlp_send->payload[0] = 0x80000000;
+	else
+		tlp.tlp_send->payload[0] = 0;
+
+	mmc_wait_for_req(host, &mrq);
+
+	if (tlp.error)
+		return tlp.error;
+
+	return 0;
+}
+
+int mmc_sd_read_cfg_ccmd(struct mmc_card *card, u8 offset, u8 plen, u32 *buf)
+{
+	struct mmc_host *host = card->host;
+	struct mmc_request mrq = {NULL};
+	struct mmc_tlp tlp = {NULL};
+	struct mmc_tlp_block cmd = {0}, resp = {0};
+	u16 ioadr = UHSII_IOADR(SD40_IOADR_CFG_BASE, offset);
+	int i;
+
+	mrq.tlp = &tlp;
+	tlp.tlp_send = &cmd;
+	tlp.tlp_back = &resp;
+	tlp.retries = 0;
+
+	tlp.tlp_send->header = UHSII_HD_NP | UHSII_HD_TYP_CCMD |
+		UHSII_HD_DID(card->node_id);
+	tlp.tlp_send->argument = UHSII_ARG_DIR_READ |
+		(plen << UHSII_ARG_PLEN_SHIFT) |
+		(ioadr & UHSII_ARG_IOADR_MASK);
+
+	mmc_wait_for_req(host, &mrq);
+
+	if (tlp.error)
+		return tlp.error;
+
+	for (i = 0; i < plen; i++)
+		buf[i] = tlp.tlp_back->payload[i];
+
+	return 0;
+}
+
+int mmc_sd_write_cfg_ccmd(struct mmc_card *card, u8 offset, u8 plen, u32 *buf)
+{
+	struct mmc_host *host = card->host;
+	struct mmc_request mrq = {NULL};
+	struct mmc_tlp tlp = {NULL};
+	struct mmc_tlp_block cmd = {0}, resp = {0};
+	u16 ioadr = UHSII_IOADR(SD40_IOADR_CFG_BASE, offset);
+	int i;
+
+	mrq.tlp = &tlp;
+	tlp.tlp_send = &cmd;
+	tlp.tlp_back = &resp;
+	tlp.retries = 0;
+
+	tlp.tlp_send->header = UHSII_HD_NP | UHSII_HD_TYP_CCMD |
+		UHSII_HD_DID(card->node_id);
+	tlp.tlp_send->argument = UHSII_ARG_DIR_WRITE |
+		(plen << UHSII_ARG_PLEN_SHIFT) |
+		(ioadr & UHSII_ARG_IOADR_MASK);
+	for (i = 0; i < plen; i++)
+		tlp.tlp_send->payload[i] = buf[i];
+
+	mmc_wait_for_req(host, &mrq);
+
+	if (tlp.error)
+		return tlp.error;
+
+	return 0;
+}
+
+void mmc_sd_tran_pack_ccmd(struct mmc_card *card, struct mmc_command *cmd)
+{
+	struct mmc_tlp_block *tlp_send = &cmd->tlp_send;
+
+	tlp_send->header = UHSII_HD_TYP_CCMD | UHSII_HD_DID(card->node_id);
+
+	tlp_send->argument = cmd->opcode & UHSII_ARG_CMD_INDEX_MASK;
+	if (cmd->app_cmd)
+		tlp_send->argument |= UHSII_ARG_APP_CMD;
+
+	tlp_send->payload[0] = cmd->arg;
+
+	pr_debug("%s: SDTRAN CCMD header = 0x%04x, arg = 0x%04x\n",
+		mmc_hostname(card->host), tlp_send->header, tlp_send->argument);
+}
+
+void mmc_sd_tran_pack_dcmd(struct mmc_card *card, struct mmc_command *cmd)
+{
+	u8 tmode = 0;
+	u32 tlen = 0;
+	struct mmc_tlp_block *tlp_send = &cmd->tlp_send;
+
+	tlp_send->header = UHSII_HD_TYP_DCMD | UHSII_HD_DID(card->node_id);
+
+	tlp_send->argument = cmd->opcode & UHSII_ARG_CMD_INDEX_MASK;
+	if (cmd->app_cmd)
+		tlp_send->argument |= UHSII_ARG_APP_CMD;
+	if (cmd->data && (cmd->data->flags & MMC_DATA_WRITE))
+		tlp_send->argument |= UHSII_ARG_DIR_WRITE;
+	if (mmc_op_multi(cmd->opcode)) {
+		tmode |= UHSII_TMODE_LM_SPECIFIED;
+		if (card->lane_mode & SD40_LANE_MODE_2L_HD)
+			tmode |= UHSII_TMODE_DM_HD;
+		if (cmd->data)
+			tlen = cmd->data->blocks;
+	}
+	tlp_send->argument |= tmode << UHSII_ARG_TMODE_SHIFT;
+
+	tlp_send->payload[0] = cmd->arg;
+	tlp_send->payload[1] = tlen;
+
+	pr_debug("%s: SDTRAN DCMD header = 0x%04x, arg = 0x%04x, TLEN = %d\n",
+		mmc_hostname(card->host), tlp_send->header, tlp_send->argument,
+		tlen);
 }

@@ -15,6 +15,57 @@ struct request;
 struct mmc_data;
 struct mmc_request;
 
+struct mmc_tlp_block {
+	u16 header;
+
+#define UHSII_HD_NP			0x8000
+#define UHSII_HD_TYP_MASK		0x7000
+#define UHSII_HD_TYP_CCMD		(0 << 12)
+#define UHSII_HD_TYP_DCMD		(1 << 12)
+#define UHSII_HD_TYP_RES		(2 << 12)
+#define UHSII_HD_TYP_DATA		(3 << 12)
+#define UHSII_HD_TYP_MSG		(7 << 12)
+#define UHSII_HD_DID_SHIFT		8
+#define UHSII_HD_DID_MASK		(0x0F << UHSII_HD_DID_SHIFT)
+#define UHSII_HD_SID_SHIFT		4
+#define UHSII_HD_SID_MASK		(0x0F << UHSII_HD_SID_SHIFT)
+
+#define UHSII_HD_DID(val) ((val) << UHSII_HD_DID_SHIFT & UHSII_HD_DID_MASK)
+#define UHSII_CHK_CCMD(val) (((val) & UHSII_HD_TYP_MASK) == UHSII_HD_TYP_CCMD)
+#define UHSII_CHK_DCMD(val) (((val) & UHSII_HD_TYP_MASK) == UHSII_HD_TYP_DCMD)
+
+	u16 argument;
+#define UHSII_ARG_DIR_WRITE		0x8000
+#define UHSII_ARG_DIR_READ		0
+#define UHSII_ARG_PLEN_SHIFT		12
+#define UHSII_ARG_PLEN_MASK		(0x03 << UHSII_ARG_PLEN_SHIFT)
+#define UHSII_ARG_IOADR_MASK		0x0FFF
+#define UHSII_ARG_RES_NACK		0x8000
+#define UHSII_ARG_TMODE_SHIFT		11
+#define UHSII_ARG_TMODE_MASK		(0x0F << UHSII_ARG_TMODE_SHIFT)
+#define  UHSII_TMODE_DM_HD		0x08
+#define  UHSII_TMODE_LM_SPECIFIED	0x04
+#define  UHSII_TMODE_TLUM_BYTE		0x02
+#define  UHSII_TMODE_DAM_FIX		0x01
+#define UHSII_ARG_APP_CMD		0x40
+#define UHSII_ARG_CMD_INDEX_MASK	0x3F
+
+#define UHSII_PLEN_BYTES(plen)		((plen) ? 2 << (plen) : 0)
+#define UHSII_PLEN_DWORDS(plen)		((plen) == 3 ? 4 : (plen))
+
+#define UHSII_GET_PLEN(tlp_block) \
+	((u8)(((tlp_block)->argument & UHSII_ARG_PLEN_MASK)	\
+		>> UHSII_ARG_PLEN_SHIFT))
+#define UHSII_GET_TMODE(tlp_block) \
+	((u8)(((tlp_block)->argument & UHSII_ARG_TMODE_MASK)	\
+		>> UHSII_ARG_TMODE_SHIFT))
+
+	u32 payload[4];
+#define UHSII_GET_GAP(tlp_block)				\
+	((u8)(((tlp_block)->payload[0] >> SD40_GAP_SHIFT)	\
+		& SD40_GAP_MASK))
+};
+
 struct mmc_command {
 	u32			opcode;
 	u32			arg;
@@ -101,6 +152,10 @@ struct mmc_command {
 
 	struct mmc_data		*data;		/* data segment associated with cmd */
 	struct mmc_request	*mrq;		/* associated request */
+
+	struct mmc_tlp_block	tlp_send;
+	bool			use_tlp;
+	bool			app_cmd;
 };
 
 struct mmc_data {
@@ -125,17 +180,50 @@ struct mmc_data {
 	s32			host_cookie;	/* host private data */
 };
 
+struct mmc_tlp {
+	struct mmc_tlp_block		*tlp_send;
+	struct mmc_tlp_block		*tlp_back;
+
+	u8				cmd_type;
+#define UHSII_COMMAND_NORMAL		0x00
+#define UHSII_COMMAND_GO_DORMANT	0x03
+
+	unsigned int			retries; /* max number of retries */
+	int				error;
+};
+
 struct mmc_host;
 struct mmc_request {
 	struct mmc_command	*sbc;		/* SET_BLOCK_COUNT for multiblock */
 	struct mmc_command	*cmd;
 	struct mmc_data		*data;
 	struct mmc_command	*stop;
+	struct mmc_tlp		*tlp;
 
 	struct completion	completion;
 	void			(*done)(struct mmc_request *);/* completion function */
 	struct mmc_host		*host;
 };
+
+static inline void mmc_set_mrq_error_code(struct mmc_request *mrq, int err)
+{
+	if (mrq->cmd)
+		mrq->cmd->error = err;
+	else
+		mrq->tlp->error = err;
+}
+
+static inline int mmc_get_mrq_error_code(struct mmc_request *mrq)
+{
+	int err;
+
+	if (mrq->cmd)
+		err = mrq->cmd->error;
+	else
+		err = mrq->tlp->error;
+
+	return err;
+}
 
 struct mmc_card;
 struct mmc_async_req;
@@ -147,7 +235,8 @@ extern struct mmc_async_req *mmc_start_req(struct mmc_host *,
 extern int mmc_interrupt_hpi(struct mmc_card *);
 extern void mmc_wait_for_req(struct mmc_host *, struct mmc_request *);
 extern int mmc_wait_for_cmd(struct mmc_host *, struct mmc_command *, int);
-extern int mmc_app_cmd(struct mmc_host *, struct mmc_card *);
+extern int mmc_app_cmd(struct mmc_host *, struct mmc_card *,
+	struct mmc_command *);
 extern int mmc_wait_for_app_cmd(struct mmc_host *, struct mmc_card *,
 	struct mmc_command *, int);
 extern void mmc_start_bkops(struct mmc_card *card, bool from_exception);
